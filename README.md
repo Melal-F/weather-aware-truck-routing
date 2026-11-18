@@ -11,10 +11,11 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r backend/requirements.txt
 cp .env.example .env
-# Put a free OpenRouteService key in .env as ORS_API_KEY
+# Copying .env.example to .env is enough; Django loads it automatically.
+# Put a free OpenRouteService key in .env as ORS_API_KEY.
+# Real environment variables override the file.
 
 cd backend
-export ORS_API_KEY=your-key
 python manage.py runserver
 ```
 
