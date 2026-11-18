@@ -99,7 +99,7 @@ The recommended card states the first of those keys that actually separated the 
 
 ## Units
 
-The page and the API stay in miles, mph, inches per hour, and pounds. Open-Meteo wind is requested in mph. Rain comes back in millimeters per hour and is divided by 25.4. Snow comes back in centimeters per hour and is divided by 2.54.
+The page and the API stay in miles, mph, inches per hour, and pounds. Open-Meteo wind is requested in mph. Rain = Open-Meteo rain + showers (mm/h) ÷ 25.4. Snow comes back in centimeters per hour and is divided by 2.54.
 
 ## The map and the slider
 

@@ -413,7 +413,7 @@ def open_meteo(points, start, end):
             params={
                 "latitude": ",".join(f"{lat:.5f}" for lat, _lng in chunk),
                 "longitude": ",".join(f"{lng:.5f}" for _lat, lng in chunk),
-                "hourly": "wind_speed_10m,rain,snowfall",
+                "hourly": "wind_speed_10m,rain,showers,snowfall",
                 "wind_speed_unit": "mph",
                 "timezone": "GMT",
                 "start_date": start.date().isoformat(),
@@ -437,11 +437,21 @@ def open_meteo(points, start, end):
             raise PlanError("The weather service returned an unexpected forecast.", status=502)
         for row in chunk_rows:
             hourly = row.get("hourly") or {}
+            rain_mm = hourly.get("rain") or []
+            showers_mm = hourly.get("showers") or []
+            rain_total = []
+            for index in range(max(len(rain_mm), len(showers_mm))):
+                steady = rain_mm[index] if index < len(rain_mm) else None
+                shower = showers_mm[index] if index < len(showers_mm) else None
+                if steady is None and shower is None:
+                    rain_total.append(None)
+                else:
+                    rain_total.append((steady or 0) + (shower or 0))
             rows.append(
                 {
                     "time": hourly.get("time") or [],
                     "wind_speed_10m": hourly.get("wind_speed_10m") or [],
-                    "rain": hourly.get("rain") or [],
+                    "rain": rain_total,
                     "snowfall": hourly.get("snowfall") or [],
                 }
             )

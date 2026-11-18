@@ -210,5 +210,119 @@ class ViaOffsetTest(unittest.TestCase):
         self.assertAlmostEqual(capped_km[5], 120, delta=2)
 
 
+_MISSING = object()
+
+
+def _one_route(_origin, _destination, _load_lb=None):
+    return [{"coords": [(41.0, -87.6), (41.02, -87.6)], "duration_seconds": 600}]
+
+
+class ShowerRainTest(unittest.TestCase):
+    def _run(self, get, rain, showers=_MISSING):
+        times = _hours()
+        count = len(times)
+
+        def as_list(value):
+            if isinstance(value, list):
+                return value
+            return [value] * count
+
+        def forecast(url, params=None, timeout=None):
+            self.assertEqual(params["hourly"], "wind_speed_10m,rain,showers,snowfall")
+            hourly = {
+                "time": times,
+                "wind_speed_10m": [0.0] * count,
+                "snowfall": [0.0] * count,
+            }
+            if rain is not _MISSING:
+                hourly["rain"] = as_list(rain)
+            if showers is not _MISSING:
+                hourly["showers"] = as_list(showers)
+            lats = [part for part in str(params["latitude"]).split(",") if part != ""]
+            rows = [{"hourly": hourly} for _lat in lats]
+            payload = rows[0] if len(rows) == 1 else rows
+            return _response(200, payload)
+
+        get.side_effect = forecast
+        start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        series = open_meteo([(41.0, -87.6)], start, start + timedelta(days=2))
+        plan = build_plan(
+            {
+                "origin": {"name": "A", "lat": 41.0, "lng": -87.6},
+                "destination": {"name": "B", "lat": 41.02, "lng": -87.6},
+                "departure": "2026-11-18T12:30:00+00:00",
+                "load_lb": 1000,
+                "spacing_miles": 25,
+            },
+            _one_route,
+            open_meteo,
+        )
+        return series[0]["rain"], plan["routes"][0]["checkpoints"][0]
+
+    @patch("routing.services.requests.get")
+    def test_showers_raise_steady_rain_to_severe(self, get):
+        stored, point = self._run(get, 0.0, 15.0)
+        self.assertEqual(stored, [15.0] * len(_hours()))
+        self.assertAlmostEqual(point["rain_in_hr"], 15 / 25.4, places=3)
+        self.assertEqual(point["rain_level"], "Severe")
+
+    @patch("routing.services.requests.get")
+    def test_none_showers_leave_moderate_rain(self, get):
+        stored, point = self._run(get, 3.0, None)
+        self.assertEqual(stored, [3.0] * len(_hours()))
+        self.assertAlmostEqual(point["rain_in_hr"], 3 / 25.4, places=3)
+        self.assertEqual(point["rain_level"], "Moderate")
+
+    @patch("routing.services.requests.get")
+    def test_missing_rain_and_showers_are_not_safe(self, get):
+        stored, point = self._run(get, None, None)
+        self.assertEqual(stored, [None] * len(_hours()))
+        self.assertIsNone(point["rain_in_hr"])
+        self.assertIsNone(point["rain_level"])
+
+    @patch("routing.services.requests.get")
+    def test_missing_showers_key_leaves_rain_unchanged(self, get):
+        rain = [None] + [0.0] * (len(_hours()) - 1)
+        stored, point = self._run(get, rain)
+        self.assertEqual(stored, rain)
+        self.assertIsNone(stored[0])
+        self.assertAlmostEqual(point["rain_in_hr"], 0.0, places=3)
+        self.assertEqual(point["rain_level"], "Low")
+
+    @patch("routing.services.requests.get")
+    def test_short_showers_count_as_zero(self, get):
+        payloads = [
+            {
+                "hourly": {
+                    "time": ["2026-11-18T00:00", "2026-11-18T01:00", "2026-11-18T02:00"],
+                    "wind_speed_10m": [0.0, 0.0, 0.0],
+                    "rain": [None, 0.0, 4.0],
+                    "showers": [15.0, None],
+                    "snowfall": [0.0, 0.0, 0.0],
+                }
+            },
+            {
+                "hourly": {
+                    "time": ["2026-11-18T00:00", "2026-11-18T01:00"],
+                    "wind_speed_10m": [0.0, 0.0],
+                    "showers": [None, 15.0],
+                    "snowfall": [0.0, 0.0],
+                }
+            },
+            {"hourly": {"time": [], "wind_speed_10m": [], "snowfall": []}},
+        ]
+
+        def forecast(url, params=None, timeout=None):
+            return _response(200, payloads.pop(0))
+
+        get.side_effect = forecast
+        start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        point = [(41.0, -87.6)]
+        self.assertEqual(open_meteo(point, start, end)[0]["rain"], [15.0, 0.0, 4.0])
+        self.assertEqual(open_meteo(point, start, end)[0]["rain"], [None, 15.0])
+        self.assertEqual(open_meteo(point, start, end)[0]["rain"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
