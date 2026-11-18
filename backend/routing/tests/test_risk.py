@@ -127,8 +127,40 @@ class MilesAndAverageTest(unittest.TestCase):
             {"mile": 30, "level": "Low"},
         ]
         miles = miles_by_level(checkpoints)
-        self.assertAlmostEqual(sum(miles.values()), 20)
+        self.assertAlmostEqual(sum(miles.values()), 30)
+        self.assertAlmostEqual(miles["Low"], 30)
         self.assertAlmostEqual(average_risk(miles), 1)
+
+    def test_destination_hazard_counts_on_the_stretch_that_ends_there(self):
+        checkpoints = [
+            {"mile": 0, "level": "Low"},
+            {"mile": 25, "level": "Low"},
+            {"mile": 40, "level": "Severe"},
+        ]
+        miles = miles_by_level(checkpoints)
+        self.assertAlmostEqual(miles["Severe"], 15.0)
+        self.assertAlmostEqual(miles["Low"], 25.0)
+        for name in ("Moderate", "High", "No Travel"):
+            self.assertAlmostEqual(miles[name], 0)
+
+    def test_opening_hazard_counts_on_the_stretch_that_starts_there(self):
+        checkpoints = [
+            {"mile": 0, "level": "Severe"},
+            {"mile": 25, "level": "Low"},
+            {"mile": 50, "level": "Low"},
+        ]
+        miles = miles_by_level(checkpoints)
+        self.assertAlmostEqual(miles["Severe"], 25.0)
+        self.assertAlmostEqual(miles["Low"], 25.0)
+
+    def test_none_at_one_end_keeps_the_other_level(self):
+        checkpoints = [
+            {"mile": 0, "level": "Low"},
+            {"mile": 25, "level": None},
+            {"mile": 50, "level": "Low"},
+        ]
+        miles = miles_by_level(checkpoints)
+        self.assertAlmostEqual(miles["Low"], 50.0)
 
     def test_no_scored_miles(self):
         self.assertIsNone(average_risk({name: 0.0 for name in RANK}))

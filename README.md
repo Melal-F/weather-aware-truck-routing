@@ -78,7 +78,7 @@ Load changes wind only, and it is applied before the worst-of step:
 
 Rain and snow do not use the load cutoffs.
 
-Miles of a level are the path miles from a checkpoint to the next one, tagged with the level at the checkpoint where that stretch starts. The destination does not open a new stretch.
+Miles of a level are the path miles from a checkpoint to the next one, tagged with the worse of the two checkpoints that bound it, so a hazard at either end counts.
 
 Average risk is the distance-weighted mean of Low = 1, Moderate = 2, High = 3, Severe = 4, No Travel = 5.
 

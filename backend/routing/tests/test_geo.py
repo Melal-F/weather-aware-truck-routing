@@ -1,7 +1,9 @@
+import math
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from routing.geo import (
+    EARTH_MILES,
     color_segments,
     corridor_samples,
     cumulative_miles,
@@ -9,6 +11,7 @@ from routing.geo import (
     place_checkpoints,
     sample_miles,
 )
+from routing.risk import LEVELS, miles_by_level
 
 
 class SampleMilesTest(unittest.TestCase):
@@ -54,9 +57,39 @@ class PlaceCheckpointsTest(unittest.TestCase):
             {"mile": total, "lat": 0, "lng": 1, "level": "Severe"},
         ]
         segments = color_segments(coords, checkpoints)
-        self.assertEqual(segments[0]["level"], "Low")
-        self.assertEqual(segments[-1]["level"], "High")
-        self.assertNotIn("Severe", [segment["level"] for segment in segments])
+        self.assertEqual(segments[0]["level"], "High")
+        self.assertEqual(segments[-1]["level"], "Severe")
+        self.assertEqual({segment["level"] for segment in segments}, {"High", "Severe"})
+
+    def test_color_lengths_match_miles_by_the_worse_end(self):
+        def at(mile):
+            return (0.0, math.degrees(mile / EARTH_MILES))
+
+        coords = [at(0), at(25), at(40)]
+        marks = cumulative_miles(coords)
+        self.assertAlmostEqual(marks[1], 25, delta=0.01)
+        self.assertAlmostEqual(marks[2], 40, delta=0.01)
+        checkpoints = [
+            {"mile": 0, "lat": 0.0, "lng": 0.0, "level": "Low"},
+            {"mile": 25, "lat": coords[1][0], "lng": coords[1][1], "level": "Low"},
+            {"mile": 40, "lat": coords[2][0], "lng": coords[2][1], "level": "Severe"},
+        ]
+        segments = color_segments(coords, checkpoints)
+        self.assertEqual(segments[-1]["level"], "Severe")
+
+        colored = {name: 0.0 for name in LEVELS}
+        for segment in segments:
+            positions = segment["positions"]
+            length = sum(
+                haversine_miles(positions[index], positions[index + 1])
+                for index in range(len(positions) - 1)
+            )
+            self.assertIn(segment["level"], colored)
+            colored[segment["level"]] += length
+
+        expected = miles_by_level(checkpoints)
+        for name in LEVELS:
+            self.assertAlmostEqual(colored[name], expected[name], delta=0.01)
 
     def test_corridor_cap(self):
         coords = [(0.0, mile / 69.0) for mile in range(0, 400)]

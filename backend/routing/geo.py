@@ -3,6 +3,8 @@
 import math
 from datetime import timedelta
 
+from routing.risk import worst
+
 EARTH_MILES = 3958.7613
 
 
@@ -139,7 +141,7 @@ def _with_miles(coords):
 
 
 def color_segments(coords, checkpoints):
-    """Split the path so each piece carries the level of the checkpoint that opens it."""
+    """Split the path so each piece carries the worse level of the checkpoints that bound it."""
     if len(coords) < 2 or not checkpoints:
         return []
     points = _with_miles(coords)
@@ -159,20 +161,17 @@ def color_segments(coords, checkpoints):
 
     ordered = sorted(checkpoints, key=lambda item: item["mile"])
 
-    def level_at(mile):
-        chosen = ordered[0].get("level")
-        for checkpoint in ordered:
-            if checkpoint["mile"] <= mile + 1e-6:
-                chosen = checkpoint.get("level")
-            else:
-                break
-        return chosen
+    def bounded_level(mile):
+        for left, right in zip(ordered, ordered[1:]):
+            if left["mile"] <= mile + 1e-6 < right["mile"]:
+                return worst((left.get("level"), right.get("level")))
+        return None
 
     segments = []
     for start, end in zip(points, points[1:]):
         if end["mile"] - start["mile"] <= 1e-9:
             continue
-        level = level_at(start["mile"])
+        level = bounded_level(start["mile"])
         piece = [[start["lat"], start["lng"]], [end["lat"], end["lng"]]]
         if segments and segments[-1]["level"] == level:
             segments[-1]["positions"].append(piece[1])
