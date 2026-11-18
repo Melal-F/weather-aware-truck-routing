@@ -2,6 +2,7 @@
 
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -107,20 +108,15 @@ def floor_hour(moment):
     return moment.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
 
-def hour_token(moment):
-    return floor_hour(moment).strftime("%Y-%m-%dT%H:%M")
-
-
-def find_hour(times, moment):
-    token = hour_token(moment)
-    for index, raw in enumerate(times):
-        if str(raw)[:16] == token:
-            return index
-    return None
+def hour_index(row, moment):
+    if not row.get("first"):
+        return None
+    i = int((floor_hour(moment) - row["first"]) // timedelta(hours=1))
+    return i if 0 <= i < len(row["time"]) else None
 
 
 def reading_at(hourly, moment):
-    index = find_hour(hourly["time"], moment)
+    index = hour_index(hourly, moment)
     if index is None:
         raise PlanError(
             "The forecast does not cover that departure. Pick a time within the next week.",
@@ -280,7 +276,7 @@ def _ors_call(profile, coordinates, load_lb, key, alternatives):
         ORS_URL.format(profile=profile),
         json=_ors_body(coordinates, load_lb if profile == "driving-hgv" else None, alternatives),
         headers=_ors_headers(key),
-        timeout=30,
+        timeout=15,
     )
     if response.status_code in (400, 403, 404):
         return [], "refused"
@@ -339,21 +335,34 @@ def ors_routes(origin, destination, load_lb=None):
     for route in routes or []:
         _keep_distinct(kept, route)
     if long_trip and len(kept) < 3:
-        for via in via_points(origin, destination):
-            if len(kept) >= 3:
-                break
-            path = [
+        paths = [
+            [
                 [origin["lng"], origin["lat"]],
                 [via["lng"], via["lat"]],
                 [destination["lng"], destination["lat"]],
             ]
+            for via in via_points(origin, destination)
+        ]
+
+        def fetch_via(path):
             try:
                 extra, extra_status = _ors_call(profile, path, load_lb, key, False)
-            except PlanError:
-                continue
+            except (PlanError, requests.RequestException):
+                return None
             if extra_status != "ok" or not extra:
+                return None
+            return extra[0]
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_via, path): index for index, path in enumerate(paths)}
+            candidates = [None] * len(paths)
+            for future, index in futures.items():
+                candidates[index] = future.result()
+        for candidate in candidates:
+            if len(kept) >= 3:
+                break
+            if candidate is None:
                 continue
-            candidate = extra[0]
             if kept and candidate["duration_seconds"] > DETOUR_LIMIT * min(
                 route["duration_seconds"] for route in kept
             ):
@@ -419,6 +428,60 @@ def ors_autocomplete(query):
     return found
 
 
+def _forecast_chunk(chunk, start, end):
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": ",".join(f"{lat:.5f}" for lat, _lng in chunk),
+            "longitude": ",".join(f"{lng:.5f}" for _lat, lng in chunk),
+            "hourly": "wind_speed_10m,rain,showers,snowfall",
+            "wind_speed_unit": "mph",
+            "timezone": "GMT",
+            "start_date": start.date().isoformat(),
+            "end_date": end.date().isoformat(),
+        },
+        timeout=20,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code >= 400 or not isinstance(payload, (dict, list)):
+        reason = "The weather service rejected the forecast request."
+        if isinstance(payload, dict) and payload.get("reason"):
+            reason = str(payload["reason"])
+        raise PlanError(reason, status=502)
+    if isinstance(payload, dict) and payload.get("error"):
+        raise PlanError(payload.get("reason") or "The weather service rejected the forecast request.", status=502)
+    chunk_rows = payload if isinstance(payload, list) else [payload]
+    if len(chunk_rows) != len(chunk):
+        raise PlanError("The weather service returned an unexpected forecast.", status=502)
+    rows = []
+    for row in chunk_rows:
+        hourly = row.get("hourly") or {}
+        rain_mm = hourly.get("rain") or []
+        showers_mm = hourly.get("showers") or []
+        rain_total = []
+        for index in range(max(len(rain_mm), len(showers_mm))):
+            steady = rain_mm[index] if index < len(rain_mm) else None
+            shower = showers_mm[index] if index < len(showers_mm) else None
+            if steady is None and shower is None:
+                rain_total.append(None)
+            else:
+                rain_total.append((steady or 0) + (shower or 0))
+        times = hourly.get("time") or []
+        rows.append(
+            {
+                "time": times,
+                "first": datetime.fromisoformat(times[0]).replace(tzinfo=timezone.utc) if times else None,
+                "wind_speed_10m": hourly.get("wind_speed_10m") or [],
+                "rain": rain_total,
+                "snowfall": hourly.get("snowfall") or [],
+            }
+        )
+    return rows
+
+
 def open_meteo(points, start, end):
     """Hourly wind, rain, and snow for every point.
 
@@ -427,57 +490,13 @@ def open_meteo(points, start, end):
     """
     if not points:
         return []
-    rows = []
-    for offset in range(0, len(points), WEATHER_CHUNK):
-        chunk = points[offset : offset + WEATHER_CHUNK]
-        response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": ",".join(f"{lat:.5f}" for lat, _lng in chunk),
-                "longitude": ",".join(f"{lng:.5f}" for _lat, lng in chunk),
-                "hourly": "wind_speed_10m,rain,showers,snowfall",
-                "wind_speed_unit": "mph",
-                "timezone": "GMT",
-                "start_date": start.date().isoformat(),
-                "end_date": end.date().isoformat(),
-            },
-            timeout=40,
-        )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if response.status_code >= 400 or not isinstance(payload, (dict, list)):
-            reason = "The weather service rejected the forecast request."
-            if isinstance(payload, dict) and payload.get("reason"):
-                reason = str(payload["reason"])
-            raise PlanError(reason, status=502)
-        if isinstance(payload, dict) and payload.get("error"):
-            raise PlanError(payload.get("reason") or "The weather service rejected the forecast request.", status=502)
-        chunk_rows = payload if isinstance(payload, list) else [payload]
-        if len(chunk_rows) != len(chunk):
-            raise PlanError("The weather service returned an unexpected forecast.", status=502)
-        for row in chunk_rows:
-            hourly = row.get("hourly") or {}
-            rain_mm = hourly.get("rain") or []
-            showers_mm = hourly.get("showers") or []
-            rain_total = []
-            for index in range(max(len(rain_mm), len(showers_mm))):
-                steady = rain_mm[index] if index < len(rain_mm) else None
-                shower = showers_mm[index] if index < len(showers_mm) else None
-                if steady is None and shower is None:
-                    rain_total.append(None)
-                else:
-                    rain_total.append((steady or 0) + (shower or 0))
-            rows.append(
-                {
-                    "time": hourly.get("time") or [],
-                    "wind_speed_10m": hourly.get("wind_speed_10m") or [],
-                    "rain": rain_total,
-                    "snowfall": hourly.get("snowfall") or [],
-                }
-            )
-    return rows
+    chunks = [points[offset : offset + WEATHER_CHUNK] for offset in range(0, len(points), WEATHER_CHUNK)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_forecast_chunk, chunk, start, end): index for index, chunk in enumerate(chunks)}
+        parts = [None] * len(chunks)
+        for future, index in futures.items():
+            parts[index] = future.result()
+    return [row for part in parts for row in part]
 
 
 def _point_key(lat, lng):
@@ -551,7 +570,11 @@ def build_plan(payload, fetch_routes, fetch_weather):
     series = fetch_weather(points, start, end)
     if len(series) != len(points):
         raise PlanError("The weather service returned an unexpected forecast.", status=502)
-    if not series or find_hour(series[0]["time"], start) is None or find_hour(series[0]["time"], start + timedelta(hours=48)) is None:
+    for row in series:
+        if not row.get("first"):
+            times = row.get("time") or []
+            row["first"] = datetime.fromisoformat(times[0]).replace(tzinfo=timezone.utc) if times else None
+    if not series or hour_index(series[0], start) is None or hour_index(series[0], start + timedelta(hours=48)) is None:
         raise PlanError(
             "The forecast does not cover that departure. Pick a time within the next week.",
             status=502,
