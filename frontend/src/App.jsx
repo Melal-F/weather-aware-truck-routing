@@ -9,12 +9,30 @@ import {
   planTrip,
 } from "./api";
 
+function formatLocal(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function defaultDeparture() {
   const next = new Date();
   next.setMinutes(0, 0, 0);
   next.setHours(next.getHours() + 1);
-  const pad = (value) => String(value).padStart(2, "0");
-  return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T${pad(next.getHours())}:00`;
+  return formatLocal(next);
+}
+
+function departureWindow(now = new Date()) {
+  return {
+    min: formatLocal(new Date(now.getTime() - 60 * 60 * 1000)),
+    max: formatLocal(new Date(now.getTime() + 13 * 24 * 60 * 60 * 1000)),
+  };
+}
+
+function parseLocal(value) {
+  const [day, clock] = value.split("T");
+  const [year, month, date] = day.split("-").map(Number);
+  const [hour, minute] = clock.split(":").map(Number);
+  return new Date(year, month - 1, date, hour, minute);
 }
 
 function PlaceField({ id, label, query, setQuery, pick, setPick }) {
@@ -171,6 +189,12 @@ export default function App() {
       setError("Departure date and time is required.");
       return;
     }
+    const { min, max } = departureWindow();
+    const chosen = parseLocal(departure);
+    if (chosen < parseLocal(min) || chosen > parseLocal(max)) {
+      setError("Departure must be between now and 13 days ahead (forecast limit).");
+      return;
+    }
     setLoading(true);
     try {
       const origin = await resolvePlace(originPick, originQuery, "Origin");
@@ -198,6 +222,7 @@ export default function App() {
     }
   }
 
+  const { min: departureMin, max: departureMax } = departureWindow();
   const forecastLabel = plan
     ? formatWhen(new Date(new Date(plan.forecast_start).getTime() + hour * 3600000).toISOString())
     : "Plan a trip to color the corridor";
@@ -236,7 +261,15 @@ export default function App() {
                   id="departure"
                   type="datetime-local"
                   value={departure}
+                  min={departureMin}
+                  max={departureMax}
                   onChange={(event) => setDeparture(event.target.value)}
+                  onInvalid={(event) => {
+                    const { rangeUnderflow, rangeOverflow } = event.target.validity;
+                    if (!rangeUnderflow && !rangeOverflow) return;
+                    event.preventDefault();
+                    setError("Departure must be between now and 13 days ahead (forecast limit).");
+                  }}
                   required
                 />
                 <p className="hint">Times shown in your browser's time zone</p>

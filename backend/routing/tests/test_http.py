@@ -124,6 +124,15 @@ class StepEtaTest(unittest.TestCase):
 
 
 class RecommendationReasonTest(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "routing.services._utcnow",
+            return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
     @patch("routing.services.requests.get")
     @patch("routing.services.requests.post")
@@ -218,6 +227,15 @@ def _one_route(_origin, _destination, _load_lb=None):
 
 
 class ShowerRainTest(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "routing.services._utcnow",
+            return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _run(self, get, rain, showers=_MISSING):
         times = _hours()
         count = len(times)

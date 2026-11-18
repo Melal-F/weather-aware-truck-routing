@@ -28,6 +28,7 @@ from routing.risk import (
 
 SPACINGS = (10, 25, 50)
 FORECAST_HOURS = 49
+DEPARTURE_MAX_DAYS = 13
 WEATHER_CHUNK = 100
 # ORS rejects alternative_routes once the crow-flies trip is longer than this.
 ALTERNATIVES_MAX_KM = 90
@@ -49,7 +50,11 @@ class PlanError(Exception):
         self.status = status
 
 
-def parse_departure(value):
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def parse_departure(value, now=None):
     if not isinstance(value, str) or not value.strip():
         raise PlanError("Departure date and time is required.")
     text = value.strip()
@@ -61,7 +66,12 @@ def parse_departure(value):
         raise PlanError("Departure must be an ISO date and time.") from None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    if now is None:
+        now = _utcnow()
+    if parsed < now - timedelta(hours=1) or parsed > now + timedelta(days=DEPARTURE_MAX_DAYS):
+        raise PlanError("Departure must be between now and 13 days ahead (forecast limit).")
+    return parsed
 
 
 def parse_place(value, label):
@@ -119,7 +129,7 @@ def reading_at(hourly, moment):
     index = hour_index(hourly, moment)
     if index is None:
         raise PlanError(
-            "The forecast does not cover that departure. Pick a time within the next week.",
+            "The forecast does not cover that trip. Pick a departure within 13 days.",
             status=502,
         )
 
@@ -576,7 +586,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
             row["first"] = datetime.fromisoformat(times[0]).replace(tzinfo=timezone.utc) if times else None
     if not series or hour_index(series[0], start) is None or hour_index(series[0], start + timedelta(hours=48)) is None:
         raise PlanError(
-            "The forecast does not cover that departure. Pick a time within the next week.",
+            "The forecast does not cover that trip. Pick a departure within 13 days.",
             status=502,
         )
     by_key = {_point_key(lat, lng): hourly for (lat, lng), hourly in zip(points, series)}

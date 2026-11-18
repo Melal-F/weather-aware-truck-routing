@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
@@ -15,6 +16,15 @@ from django.test import Client, SimpleTestCase, override_settings
 
 @override_settings(ALLOWED_HOSTS=["testserver", "localhost", "127.0.0.1"])
 class PlanApiTest(SimpleTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "routing.services._utcnow",
+            return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_missing_key_is_a_clear_error(self):
         response = Client().post(
             "/api/plan",

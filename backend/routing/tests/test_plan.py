@@ -1,7 +1,8 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from routing.services import PlanError, build_plan, routes_from_geojson
+from routing.services import PlanError, build_plan, parse_departure, routes_from_geojson
 
 
 DEPARTURE = "2026-11-18T12:30:00+00:00"
@@ -56,6 +57,15 @@ def payload(**overrides):
 
 
 class BuildPlanTest(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "routing.services._utcnow",
+            return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_no_travel_route_loses_and_heatmap_is_local(self):
         plan = build_plan(
             payload(),
@@ -175,6 +185,31 @@ class GeoJsonTest(unittest.TestCase):
         }
         routes = routes_from_geojson(payload)
         self.assertEqual(len(routes[0]["coords"]), 4)
+
+
+WINDOW_ERROR = "Departure must be between now and 13 days ahead (forecast limit)."
+
+
+class ParseDepartureWindowTest(unittest.TestCase):
+    def test_fourteen_days_ahead_is_rejected(self):
+        now = datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc)
+        with self.assertRaises(PlanError) as caught:
+            parse_departure((now + timedelta(days=14)).isoformat(), now=now)
+        self.assertEqual(str(caught.exception), WINDOW_ERROR)
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_two_hours_ago_is_rejected(self):
+        now = datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc)
+        with self.assertRaises(PlanError) as caught:
+            parse_departure((now - timedelta(hours=2)).isoformat(), now=now)
+        self.assertEqual(str(caught.exception), WINDOW_ERROR)
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_two_hours_ahead_is_accepted(self):
+        now = datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc)
+        parsed = parse_departure((now + timedelta(hours=2)).isoformat(), now=now)
+        self.assertEqual(parsed, now + timedelta(hours=2))
+        self.assertEqual(parsed.tzinfo, timezone.utc)
 
 
 if __name__ == "__main__":
