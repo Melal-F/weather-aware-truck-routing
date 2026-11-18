@@ -239,6 +239,7 @@ export default function App() {
                   onChange={(event) => setDeparture(event.target.value)}
                   required
                 />
+                <p className="hint">Times shown in your browser's time zone</p>
               </div>
               <div className="field">
                 <label htmlFor="load">Load weight (lb)</label>
