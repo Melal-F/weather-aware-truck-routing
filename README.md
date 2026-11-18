@@ -50,11 +50,13 @@ Origin and destination (a picked place, with a name and coordinates), departure 
 
 ## Routes
 
-One OpenRouteService call asks for three alternatives on the `driving-hgv` profile. If that profile is refused, the same call is made with `driving-car`. The app does not invent a missing route. When fewer than three come back, the note on the page says so.
+The first call asks OpenRouteService for three alternatives on the `driving-hgv` profile. The truck’s load is sent as a weight restriction in metric tonnes (`pounds × 0.00045359237`). If that profile is refused, the same call is made with `driving-car` and no weight restriction.
+
+On a trip longer than 100 km, three alternatives are not guaranteed. When fewer than three distinct lines come back, the app asks again through points set off to either side of the straight line between the cities, and keeps a route only when it stays more than about 5 miles away from the ones already kept. It still does not invent a line the service did not return. When fewer than three survive, the note on the page says so.
 
 Checkpoints sit on the driven path, not on a straight line between cities. The origin and the destination are always included. The last gap is shorter when the length is not a multiple of the spacing.
 
-The ETA at a checkpoint is the departure time plus the route duration scaled by distance along the path. Weather for that checkpoint is the forecast hour that contains the ETA.
+The ETA at a checkpoint follows the driving time OpenRouteService reports on each step, spread along that step by distance. If a route has no steps, time falls back to the whole-route duration scaled by distance. Weather for that checkpoint is the forecast hour that contains the ETA.
 
 ## Risk rules
 
@@ -91,18 +93,35 @@ Best first:
 
 No Travel is sorted first so an impassable route cannot beat a route that is only severe. The brief’s four keys follow that, in the same order.
 
+The recommended card states the first of those keys that actually separated the winner, for example “Recommended for the fewest Severe miles.” A full tie keeps the first route the service returned.
+
 ## Units
 
 The page and the API stay in miles, mph, inches per hour, and pounds. Open-Meteo wind is requested in mph. Rain comes back in millimeters per hour and is divided by 25.4. Snow comes back in centimeters per hour and is divided by 2.54.
 
 ## The map and the slider
 
-All routes are drawn at once, split into runs of one risk color. Checkpoints are dots. A popup shows the mile, the ETA, the combined risk, and the wind, rain, and snow readings with their own levels. The panel lists distance, travel time, arrival, miles in each level, average risk, and a Recommended badge. Click a card or a line to select that route.
+All routes are drawn at once, split into runs of one risk color. Each route keeps a summary label on the map (distance, travel time, average risk). Checkpoints are dots. Hovering a checkpoint shows the mile, the ETA, the combined risk, and the wind, rain, and snow readings. A click opens the same detail and selects that route. The panel lists distance, travel time, arrival, miles in each level, average risk, and a Recommended badge with the reason under it.
 
-The 0–48 hour slider is separate from checkpoint risk. Hour 0 is the departure hour, and hour 48 is 48 hours later. It recolors a corridor drawn along the routes from forecast data that was already loaded. Dragging it does not call the network again and does not change ETAs.
+The corridor is a band of radial gradients along the routes, about 16 km across, drawn wider in pixels as you zoom in. All 49 hours are cached for the current view, so dragging the slider or pressing Play only swaps a frame. Hide corridor turns the band off. None of that calls the network again, and checkpoint risk stays tied to arrival time. Hour 0 is the departure hour. Hour 48 is 48 hours later.
 
 Colors: Low green, Moderate yellow, High orange, Severe red, No Travel black.
 
-## Hosting
+## Deploy on Render
 
-Build with Docker and run the image on any host that can store `ORS_API_KEY` and `ALLOWED_HOSTS`. The walkthrough script is in [LOOM.md](LOOM.md).
+The repo is a Docker web service. Render builds the root `Dockerfile` and runs gunicorn on port 8000.
+
+1. In Render, create a Web Service and connect `https://github.com/Melal-F/weather-aware-truck-routing`.
+2. Language: Docker. Branch: `main`. Dockerfile path: `Dockerfile`.
+3. Instance type can be the free web service. The first request after sleep takes a minute.
+4. Environment variables:
+   - `ORS_API_KEY` — free key from OpenRouteService
+   - `NOMINATIM_USER_AGENT` — `WeatherTruckRouting/1.0 (you@example.com)`
+   - `DJANGO_SECRET_KEY` — a long random string
+   - `DJANGO_DEBUG` — `0`
+   - `ALLOWED_HOSTS` — the Render hostname, such as `weather-truck-routing.onrender.com`
+5. Health check path: `/`.
+
+`docker compose up --build` is the same image locally, on http://127.0.0.1:8000.
+
+The walkthrough script is in [LOOM.md](LOOM.md).
