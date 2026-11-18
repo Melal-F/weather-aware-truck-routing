@@ -87,6 +87,9 @@ function RouteCard({ route, selected, onSelect }) {
         <strong>Route {route.id + 1}</strong>
         {route.recommended && <span className="badge">Recommended</span>}
       </header>
+      {route.recommended && route.recommendation_reason && (
+        <p className="reason">{route.recommendation_reason}</p>
+      )}
       <p className="trip-line">
         {route.distance_miles.toFixed(1)} mi · {formatDuration(route.duration_seconds)}
       </p>
@@ -139,8 +142,18 @@ export default function App() {
   const [plan, setPlan] = useState(null);
   const [selected, setSelected] = useState(null);
   const [hour, setHour] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [showHeat, setShowHeat] = useState(true);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!playing || !plan) return undefined;
+    const timer = setInterval(() => {
+      setHour((current) => (current >= 48 ? 0 : current + 1));
+    }, 800);
+    return () => clearInterval(timer);
+  }, [playing, plan]);
 
   async function onSubmit(event) {
     event.preventDefault();
@@ -174,6 +187,7 @@ export default function App() {
       setPlan(next);
       setSelected(winner ? winner.id : null);
       setHour(0);
+      setPlaying(false);
     } catch (err) {
       setError(err.message || "Could not plan that trip.");
     } finally {
@@ -268,7 +282,7 @@ export default function App() {
           </div>
         </aside>
         <div className="stage">
-          <MapView plan={plan} selected={selected} hour={hour} onSelect={setSelected} />
+          <MapView plan={plan} selected={selected} hour={hour} onSelect={setSelected} showHeat={showHeat} />
           {!plan && <p className="empty">Routes, checkpoints, and the weather corridor show up here.</p>}
           <div
             className="slider"
@@ -290,8 +304,16 @@ export default function App() {
               disabled={!plan}
               onChange={(event) => setHour(Number(event.target.value))}
             />
+            <div className="slider-actions">
+              <button type="button" disabled={!plan} onClick={() => setPlaying((on) => !on)}>
+                {playing ? "Pause" : "Play"}
+              </button>
+              <button type="button" disabled={!plan} onClick={() => setShowHeat((on) => !on)}>
+                {showHeat ? "Hide corridor" : "Show corridor"}
+              </button>
+            </div>
             <p className="hint">
-              The slider recolors weather along the corridor. Checkpoint risk stays tied to the truck’s arrival time.
+              Play walks the 48 hours on the corridor already loaded. Checkpoint risk stays tied to arrival time.
             </p>
             <ul className="legend">
               {RISK_LEVELS.map((level) => (
