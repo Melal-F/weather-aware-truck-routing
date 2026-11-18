@@ -1,0 +1,11 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ORS_API_KEY: ${ORS_API_KEY:-}
+      NOMINATIM_USER_AGENT: ${NOMINATIM_USER_AGENT:-WeatherTruckRouting/1.0}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-only-change-me}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
