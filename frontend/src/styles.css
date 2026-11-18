@@ -225,8 +225,10 @@ input:focus, select:focus {
 .empty {
   position: absolute;
   z-index: 500;
-  top: 16px;
-  left: 16px;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
   margin: 0;
   padding: 8px 10px;
   background: rgba(255, 253, 248, 0.92);
