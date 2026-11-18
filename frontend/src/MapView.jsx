@@ -13,13 +13,16 @@ function rgba(hex, alpha) {
 const LEVEL_RANK = { Low: 1, Moderate: 2, High: 3, Severe: 4, "No Travel": 5 };
 
 const HeatLayer = L.Layer.extend({
-  initialize(points) {
+  initialize(points, cellDeg) {
+    const cell = Number(cellDeg);
     this._points = points || [];
+    this._cellDeg = cell > 0 ? cell : 0.2;
     this._hour = 0;
     this._enabled = true;
     this._sprites = {};
     this._hourCache = new Map();
     this._cacheView = "";
+    this._cacheRadius = null;
     this._origin = null;
   },
 
@@ -35,7 +38,7 @@ const HeatLayer = L.Layer.extend({
 
   onAdd(map) {
     this._map = map;
-    this._canvas = L.DomUtil.create("canvas", "corridor-heat");
+    this._canvas = L.DomUtil.create("canvas", "corridor-heat leaflet-zoom-hide");
     this._canvas.style.pointerEvents = "none";
     map.getPanes().overlayPane.appendChild(this._canvas);
     this._onMove = () => {
@@ -71,10 +74,13 @@ const HeatLayer = L.Layer.extend({
     return `${map.getZoom().toFixed(2)}:${center.lat.toFixed(3)}:${center.lng.toFixed(3)}:${size.x}x${size.y}`;
   },
 
-  _radiusPx(lat) {
-    const zoom = this._map.getZoom();
-    const metersPerPixel = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / 2 ** zoom;
-    return Math.max(14, Math.min(140, 8000 / metersPerPixel));
+  _cellRadius() {
+    const map = this._map;
+    const center = map.getCenter();
+    const left = map.latLngToContainerPoint([center.lat, center.lng]);
+    const right = map.latLngToContainerPoint([center.lat, center.lng + this._cellDeg]);
+    const width = Math.hypot(right.x - left.x, right.y - left.y);
+    return Math.max(10, Math.min(160, 0.75 * width));
   },
 
   _sprite(color, alpha) {
@@ -97,7 +103,7 @@ const HeatLayer = L.Layer.extend({
 
   // Drawn low to high so the worst risk sits on top.
   // 600-point frame: 1.4 ms median, 4.9 ms max (headless Chrome, 1280×720).
-  _drawHour(ctx, ratio, hour) {
+  _drawHour(ctx, ratio, hour, radius) {
     const map = this._map;
     const size = map.getSize();
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -109,7 +115,6 @@ const HeatLayer = L.Layer.extend({
       const point = item.point;
       const level = point.risks[hour];
       const at = map.latLngToContainerPoint([point.lat, point.lng]);
-      const radius = this._radiusPx(point.lat);
       if (at.x < -radius || at.y < -radius || at.x > size.x + radius || at.y > size.y + radius) continue;
       const alpha = level ? 0.55 : 0.2;
       const sprite = this._sprite(RISK_COLORS[level] || "#8a8a8a", alpha);
@@ -145,17 +150,19 @@ const HeatLayer = L.Layer.extend({
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!this._enabled) return;
+    const radius = this._cellRadius();
     const view = this._viewKey();
-    if (view !== this._cacheView) {
+    if (view !== this._cacheView || radius !== this._cacheRadius) {
       this._hourCache.clear();
       this._cacheView = view;
+      this._cacheRadius = radius;
     }
     const frame = this._hourCache.get(this._hour);
     if (frame && frame.width === canvas.width && frame.height === canvas.height) {
       ctx.drawImage(frame, 0, 0);
       return;
     }
-    this._drawHour(ctx, ratio, this._hour);
+    this._drawHour(ctx, ratio, this._hour, radius);
     this._remember(this._hour, canvas);
   },
 });
@@ -308,7 +315,7 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
       marksRef.current.push({ id: route.id, group: markGroup });
     });
 
-    const heat = new HeatLayer(plan.corridor);
+    const heat = new HeatLayer(plan.corridor, plan.corridor_cell_deg);
     heat.setEnabled(showRef.current);
     heat.setHour(hourRef.current);
     heat.addTo(map);
