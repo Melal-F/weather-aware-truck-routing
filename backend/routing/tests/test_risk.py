@@ -9,10 +9,13 @@ from routing.risk import (
     band_wind,
     classify,
     cm_to_inches,
+    format_duration,
     miles_by_level,
     mm_to_inches,
     rank_routes,
     recommendation_reason,
+    route_sort_key,
+    UNSCORED_AVERAGE,
 )
 
 
@@ -112,10 +115,10 @@ class MilesAndAverageTest(unittest.TestCase):
             {"mile": 40, "level": "Severe"},
         ]
         miles = miles_by_level(checkpoints)
-        self.assertAlmostEqual(miles["Low"], 25)
-        self.assertAlmostEqual(miles["High"], 15)
-        self.assertAlmostEqual(miles["Severe"], 0)
-        self.assertAlmostEqual(average_risk(miles), (RANK["Low"] * 25 + RANK["High"] * 15) / 40)
+        self.assertAlmostEqual(miles["Low"], 0)
+        self.assertAlmostEqual(miles["High"], 25)
+        self.assertAlmostEqual(miles["Severe"], 15)
+        self.assertAlmostEqual(average_risk(miles), (RANK["High"] * 25 + RANK["Severe"] * 15) / 40)
 
     def test_missing_level_miles_are_not_treated_as_safe(self):
         checkpoints = [
@@ -132,6 +135,35 @@ class MilesAndAverageTest(unittest.TestCase):
 
 
 class RankRoutesTest(unittest.TestCase):
+    def _assert_reason_names_the_ranked_winner(self, routes):
+        rank_routes(routes)
+        reason = recommendation_reason(routes)
+        first = min(range(len(routes)), key=lambda index: route_sort_key(routes[index], index))
+        self.assertEqual(
+            [index for index, item in enumerate(routes) if item["recommended"]],
+            [first],
+        )
+        if len(routes) == 1:
+            self.assertEqual(reason, "Only route returned.")
+            return
+        if " vs " not in reason:
+            return
+        winner = routes[first]
+        shown = reason.split(" vs ", 1)[0].split(": ", 1)[1]
+        if reason.startswith("Fewest No Travel miles"):
+            expected = f"{winner['miles']['No Travel']:.1f}"
+        elif reason.startswith("Fewest Severe miles"):
+            expected = f"{winner['miles']['Severe']:.1f}"
+        elif reason.startswith("Fewest High miles"):
+            expected = f"{winner['miles']['High']:.1f}"
+        elif reason.startswith("Lowest average risk"):
+            value = winner["average_risk"]
+            expected = f"{(UNSCORED_AVERAGE if value is None else value):.2f}"
+        else:
+            self.assertTrue(reason.startswith("Shortest travel time: "))
+            expected = format_duration(winner["duration_seconds"])
+        self.assertEqual(shown, expected)
+
     def test_no_travel_loses_to_a_severe_route(self):
         routes = [
             route(10, 0, 0, 5, 100),
@@ -178,6 +210,7 @@ class RankRoutesTest(unittest.TestCase):
         routes = [severe, winner]
         rank_routes(routes)
         self.assertEqual(recommendation_reason(routes), "Fewest Severe miles: 0.0 vs 12.4 mi")
+        self._assert_reason_names_the_ranked_winner(routes)
 
         longer = route(0, 0, 0, 1, 6 * 3600 + 45 * 60, low=10)
         shorter = route(0, 0, 0, 1, 6 * 3600 + 10 * 60, low=10)
@@ -187,6 +220,42 @@ class RankRoutesTest(unittest.TestCase):
             recommendation_reason(tied_miles),
             "Shortest travel time: 6 h 10 min vs 6 h 45 min",
         )
+        self._assert_reason_names_the_ranked_winner(tied_miles)
+
+    def test_high_miles_use_the_runner_up_not_the_best_other_route(self):
+        orders = (("A", "B", "C"), ("C", "A", "B"), ("B", "C", "A"), ("A", "C", "B"))
+        for order in orders:
+            made = {
+                "A": route(0, 0, 10, 2, 1000),
+                "B": route(0, 0, 20, 2, 1000),
+                "C": route(0, 5, 0, 2, 1000),
+            }
+            routes = [made[name] for name in order]
+            with self.subTest(order=order):
+                rank_routes(routes)
+                self.assertEqual(
+                    recommendation_reason(routes),
+                    "Fewest High miles: 10.0 vs 20.0 mi",
+                )
+                self._assert_reason_names_the_ranked_winner(routes)
+
+    def test_duration_seconds_against_the_runner_up(self):
+        longer = route(0, 0, 0, 1, 24300, low=10)
+        shorter = route(0, 0, 0, 1, 22200, low=10)
+        routes = [longer, shorter]
+        rank_routes(routes)
+        self.assertEqual(
+            recommendation_reason(routes),
+            "Shortest travel time: 6 h 10 min vs 6 h 45 min",
+        )
+        self._assert_reason_names_the_ranked_winner(routes)
+
+    def test_only_route_returned(self):
+        routes = [route(1, 2, 3, 4, 5)]
+        rank_routes(routes)
+        self.assertEqual(recommendation_reason(routes), "Only route returned.")
+        self._assert_reason_names_the_ranked_winner(routes)
+        self.assertIsNone(recommendation_reason([]))
 
 
 class UnitConversionTest(unittest.TestCase):

@@ -99,7 +99,7 @@ def cm_to_inches(cm):
 def miles_by_level(checkpoints):
     totals = {name: 0.0 for name in LEVELS}
     for start, end in zip(checkpoints, checkpoints[1:]):
-        level = start.get("level")
+        level = worst((start.get("level"), end.get("level")))
         if level not in totals:
             continue
         totals[level] += end["mile"] - start["mile"]
@@ -125,14 +125,29 @@ def format_duration(seconds):
     return f"{hours} h {minutes} min"
 
 
+def route_sort_key(route, index):
+    average = route["average_risk"]
+    if average is None:
+        average = UNSCORED_AVERAGE
+    return (
+        route["miles"]["No Travel"],
+        route["miles"]["Severe"],
+        route["miles"]["High"],
+        average,
+        route["duration_seconds"],
+        index,
+    )
+
+
 def recommendation_reason(routes):
     """Why the recommended route won, with its number against the runner-up."""
-    winner = next((route for route in routes if route.get("recommended")), None)
-    if winner is None:
+    if not routes:
         return None
-    others = [route for route in routes if route is not winner]
-    if not others:
+    order = sorted(range(len(routes)), key=lambda index: route_sort_key(routes[index], index))
+    if len(order) == 1:
         return "Only route returned."
+    winner = routes[order[0]]
+    runner_up = routes[order[1]]
 
     def average(route):
         value = route.get("average_risk")
@@ -154,7 +169,7 @@ def recommendation_reason(routes):
     )
     for measure, label, render in checks:
         best = measure(winner)
-        other = min(measure(route) for route in others)
+        other = measure(runner_up)
         if best < other - 1e-9:
             return f"{label}: {render(best, other)}"
     return "Tied on risk and time; kept the first route the routing service returned."
@@ -169,21 +184,7 @@ def rank_routes(routes):
     if not routes:
         return routes
 
-    def sort_key(index):
-        route = routes[index]
-        average = route["average_risk"]
-        if average is None:
-            average = UNSCORED_AVERAGE
-        return (
-            route["miles"]["No Travel"],
-            route["miles"]["Severe"],
-            route["miles"]["High"],
-            average,
-            route["duration_seconds"],
-            index,
-        )
-
-    best = min(range(len(routes)), key=sort_key)
+    best = min(range(len(routes)), key=lambda index: route_sort_key(routes[index], index))
     for index, route in enumerate(routes):
         route["recommended"] = index == best
     return routes
