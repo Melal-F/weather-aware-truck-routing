@@ -182,6 +182,7 @@ def color_segments(coords, checkpoints):
 
 MILES_PER_DEG_LAT = EARTH_MILES * math.pi / 180.0
 CORRIDOR_SIDE_MILES = (10, 20)
+CORRIDOR_CELL_DEG = 0.2
 
 
 def _thin(points, cap):
@@ -223,27 +224,35 @@ def _side_point(lat, lng, east, north, distance, sign):
     )
 
 
-def corridor_samples(routes, spacing_miles, cap=600):
-    """Route samples plus points 10 and 20 miles to each side.
+def _corridor_cell(value):
+    return round(round(value / CORRIDOR_CELL_DEG) * CORRIDOR_CELL_DEG, 1)
 
-    When the list is longer than `cap`, route-line points are thinned first.
+
+def corridor_samples(routes, spacing_miles=None, cap=600, step_miles=12):
+    """Centerline every step_miles, plus points 10 and 20 miles to each side.
+
+    spacing_miles is accepted so callers keep working and is ignored.
+    Every point is snapped to a CORRIDOR_CELL_DEG cell and deduped.
     """
-    center = []
-    sides = []
+    snapped = []
+    seen = set()
     for coords in routes:
         if len(coords) < 2:
             continue
         miles = cumulative_miles(coords)
-        for mile in sample_miles(miles[-1], spacing_miles):
+        for mile in sample_miles(miles[-1], step_miles):
             lat, lng = point_at_mile(coords, miles, mile)
-            center.append((lat, lng))
             east, north = _segment_heading(coords, miles, mile)
+            raw_points = [(lat, lng)]
             for distance in CORRIDOR_SIDE_MILES:
                 for sign in (1, -1):
-                    sides.append(_side_point(lat, lng, east, north, distance, sign))
-    if len(center) + len(sides) <= cap:
-        return center + sides
-    room = cap - len(sides)
-    if room <= 0:
-        return _thin(sides, cap)
-    return _thin(center, room) + sides
+                    raw_points.append(_side_point(lat, lng, east, north, distance, sign))
+            for raw_lat, raw_lng in raw_points:
+                cell = (_corridor_cell(raw_lat), _corridor_cell(raw_lng))
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                snapped.append(cell)
+    if len(snapped) > cap:
+        return _thin(snapped, cap)
+    return snapped

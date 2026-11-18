@@ -1,5 +1,6 @@
 """Geocoding, three driving routes, and one forecast for every sample point."""
 
+import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,8 @@ import requests
 from django.core.cache import cache
 
 from routing.geo import (
+    CORRIDOR_CELL_DEG,
+    _thin,
     color_segments,
     corridor_samples,
     cumulative_miles,
@@ -30,6 +33,9 @@ SPACINGS = (10, 25, 50)
 FORECAST_HOURS = 49
 DEPARTURE_MAX_DAYS = 13
 WEATHER_CHUNK = 100
+WEATHER_CACHE_SECONDS = 1800
+MAX_WEATHER_LOCATIONS = 350
+logger = logging.getLogger(__name__)
 # ORS rejects alternative_routes once the crow-flies trip is longer than this.
 ALTERNATIVES_MAX_KM = 90
 VIA_FRACTIONS = (0.08, 0.15, 0.25)
@@ -452,6 +458,11 @@ def _forecast_chunk(chunk, start, end):
         },
         timeout=20,
     )
+    if response.status_code == 429:
+        raise PlanError(
+            "Weather service rate limit reached. Try again in a minute.",
+            status=503,
+        )
     try:
         payload = response.json()
     except ValueError:
@@ -492,25 +503,53 @@ def _forecast_chunk(chunk, start, end):
     return rows
 
 
+def _weather_cache_key(lat, lng, start_date, end_date):
+    return f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+
+
 def open_meteo(points, start, end):
     """Hourly wind, rain, and snow for every point.
 
-    One request covers up to 100 locations. A longer sample list takes another
-    request only because the forecast URL cannot hold it.
+    One request covers up to 100 cache misses. A cached series is not requested
+    again for 30 minutes. Results stay in the same order as `points`.
     """
     if not points:
         return []
-    chunks = [points[offset : offset + WEATHER_CHUNK] for offset in range(0, len(points), WEATHER_CHUNK)]
+    start_date = start.date().isoformat()
+    end_date = end.date().isoformat()
+    series = [None] * len(points)
+    misses = []
+    for index, (lat, lng) in enumerate(points):
+        cached = cache.get(_weather_cache_key(lat, lng, start_date, end_date))
+        if cached is not None:
+            series[index] = cached
+        else:
+            misses.append((index, lat, lng))
+    if not misses:
+        return series
+    miss_points = [(lat, lng) for _index, lat, lng in misses]
+    chunks = [
+        miss_points[offset : offset + WEATHER_CHUNK]
+        for offset in range(0, len(miss_points), WEATHER_CHUNK)
+    ]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_forecast_chunk, chunk, start, end): index for index, chunk in enumerate(chunks)}
+        futures = {
+            pool.submit(_forecast_chunk, chunk, start, end): index
+            for index, chunk in enumerate(chunks)
+        }
         parts = [None] * len(chunks)
         for future, index in futures.items():
             parts[index] = future.result()
-    return [row for part in parts for row in part]
+    flat = [row for part in parts for row in part]
+    for (index, lat, lng), row in zip(misses, flat):
+        cache.set(_weather_cache_key(lat, lng, start_date, end_date), row, WEATHER_CACHE_SECONDS)
+        series[index] = row
+    return series
 
 
-def _point_key(lat, lng):
-    return (round(lat, 4), round(lng, 4))
+def weather_key(lat, lng):
+    """0.1° cell, about 11 km."""
+    return (round(lat, 1), round(lng, 1))
 
 
 def _route_note(count):
@@ -557,23 +596,35 @@ def build_plan(payload, fetch_routes, fetch_weather):
     if not drafts:
         raise PlanError("No driving route was found between those places.", status=502)
 
-    points = []
-    seen = set()
-
-    def add_point(lat, lng):
-        key = _point_key(lat, lng)
-        if key in seen:
-            return
-        seen.add(key)
-        points.append((lat, lng))
-
+    checkpoint_keys = []
+    seen_checkpoints = set()
     for draft in drafts:
         for checkpoint in draft["checkpoints"]:
-            add_point(checkpoint["lat"], checkpoint["lng"])
-    corridor = corridor_samples([draft["coords"] for draft in drafts], spacing)
-    for lat, lng in corridor:
-        add_point(lat, lng)
+            key = weather_key(checkpoint["lat"], checkpoint["lng"])
+            if key in seen_checkpoints:
+                continue
+            seen_checkpoints.add(key)
+            checkpoint_keys.append(key)
 
+    corridor_keys = []
+    seen_corridor = set()
+    for lat, lng in corridor_samples([draft["coords"] for draft in drafts], spacing):
+        key = weather_key(lat, lng)
+        if key in seen_checkpoints or key in seen_corridor:
+            continue
+        seen_corridor.add(key)
+        corridor_keys.append(key)
+    if len(checkpoint_keys) > MAX_WEATHER_LOCATIONS:
+        logger.warning(
+            "Checkpoint weather cells (%s) exceed %s; corridor forecast skipped",
+            len(checkpoint_keys),
+            MAX_WEATHER_LOCATIONS,
+        )
+        corridor_keys = []
+    elif len(checkpoint_keys) + len(corridor_keys) > MAX_WEATHER_LOCATIONS:
+        corridor_keys = _thin(corridor_keys, MAX_WEATHER_LOCATIONS - len(checkpoint_keys))
+
+    points = checkpoint_keys + corridor_keys
     start = floor_hour(departure)
     latest = max(checkpoint["eta"] for draft in drafts for checkpoint in draft["checkpoints"])
     end = floor_hour(max(departure + timedelta(hours=48), latest))
@@ -589,10 +640,10 @@ def build_plan(payload, fetch_routes, fetch_weather):
             "The forecast does not cover that trip. Pick a departure within 13 days.",
             status=502,
         )
-    by_key = {_point_key(lat, lng): hourly for (lat, lng), hourly in zip(points, series)}
+    by_key = {key: hourly for key, hourly in zip(points, series)}
 
     def weather(lat, lng, moment):
-        return reading_at(by_key[_point_key(lat, lng)], moment)
+        return reading_at(by_key[weather_key(lat, lng)], moment)
 
     routes = []
     for index, draft in enumerate(drafts):
@@ -632,7 +683,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
         route["recommendation_reason"] = reason if route["recommended"] else None
 
     corridor_out = []
-    for lat, lng in corridor:
+    for lat, lng in corridor_keys:
         risks = []
         for hour in range(FORECAST_HOURS):
             wind, rain, snow = weather(lat, lng, start + timedelta(hours=hour))
@@ -644,6 +695,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
         "forecast_start": start.isoformat(),
         "load_lb": load_lb,
         "spacing_miles": spacing,
+        "corridor_cell_deg": CORRIDOR_CELL_DEG,
         "origin": origin,
         "destination": destination,
         "note": _route_note(len(routes)),

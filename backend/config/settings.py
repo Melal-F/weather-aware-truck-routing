@@ -41,7 +41,13 @@ DATABASES = {
     }
 }
 
-CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        # Locmem drops past 300 keys. One plan caches up to 350 forecasts.
+        "OPTIONS": {"MAX_ENTRIES": 5000},
+    }
+}
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"

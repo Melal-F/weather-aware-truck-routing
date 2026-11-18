@@ -4,11 +4,14 @@ from datetime import datetime, timedelta, timezone
 
 from routing.geo import (
     EARTH_MILES,
+    _segment_heading,
+    _side_point,
     color_segments,
     corridor_samples,
     cumulative_miles,
     haversine_miles,
     place_checkpoints,
+    point_at_mile,
     sample_miles,
 )
 from routing.risk import LEVELS, miles_by_level
@@ -97,25 +100,35 @@ class PlaceCheckpointsTest(unittest.TestCase):
         self.assertEqual(len(sampled), 30)
 
     def test_north_south_route_offsets_side_points(self):
-        sampled = corridor_samples([[(40.0, -90.0), (41.0, -90.0)]], spacing_miles=30)
+        route = [(40.0, -90.0), (41.0, -90.0)]
+        sampled = corridor_samples([route], spacing_miles=30)
+        self.assertEqual(sampled, corridor_samples([route], spacing_miles=10))
+        cell = 0.2
+
+        def center(value):
+            return round(round(value / cell) * cell, 1)
+
+        for lat, lng in sampled:
+            self.assertAlmostEqual(lat, center(lat), places=5)
+            self.assertAlmostEqual(lng, center(lng), places=5)
         centers = [point for point in sampled if abs(point[1] + 90) < 1e-6]
         self.assertGreaterEqual(len(centers), 2)
-        middle = min(centers, key=lambda point: abs(point[0] - 40.5))
-        sides = [
-            point
-            for point in sampled
-            if abs(point[0] - middle[0]) < 0.02 and abs(point[1] + 90) > 1e-4
-        ]
-        self.assertEqual(len(sides), 4)
-        for point in sides:
-            self.assertAlmostEqual(point[0], middle[0], delta=0.01)
-        distances = sorted(haversine_miles(middle, point) for point in sides)
-        self.assertAlmostEqual(distances[0], 10, delta=0.8)
-        self.assertAlmostEqual(distances[1], 10, delta=0.8)
-        self.assertAlmostEqual(distances[2], 20, delta=0.8)
-        self.assertAlmostEqual(distances[3], 20, delta=0.8)
-        self.assertTrue(any(point[1] < -90 for point in sides))
-        self.assertTrue(any(point[1] > -90 for point in sides))
+        self.assertTrue(any(point[1] < -90 for point in sampled))
+        self.assertTrue(any(point[1] > -90 for point in sampled))
+
+        miles = cumulative_miles(route)
+        marks = sample_miles(miles[-1], 12)
+        target = marks[len(marks) // 2]
+        lat, lng = point_at_mile(route, miles, target)
+        east, north = _segment_heading(route, miles, target)
+        for distance in (10, 20):
+            for sign in (1, -1):
+                raw = _side_point(lat, lng, east, north, distance, sign)
+                snapped = (center(raw[0]), center(raw[1]))
+                self.assertIn(snapped, sampled)
+                self.assertLessEqual(abs(snapped[0] - raw[0]), cell / 2 + 1e-9)
+                self.assertLessEqual(abs(snapped[1] - raw[1]), cell / 2 + 1e-9)
+                self.assertGreater(abs(snapped[1] + 90), 1e-6)
 
 
 if __name__ == "__main__":
