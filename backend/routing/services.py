@@ -10,7 +10,9 @@ from routing.geo import (
     color_segments,
     corridor_samples,
     cumulative_miles,
+    haversine_miles,
     place_checkpoints,
+    time_at_coords,
 )
 from routing.risk import (
     average_risk,
@@ -19,11 +21,15 @@ from routing.risk import (
     miles_by_level,
     mm_to_inches,
     rank_routes,
+    recommendation_reason,
 )
 
 SPACINGS = (10, 25, 50)
 FORECAST_HOURS = 49
 WEATHER_CHUNK = 100
+LONG_TRIP_KM = 100
+LB_TO_TONNES = 0.00045359237
+KM_PER_MILE = 1.609344
 ORS_URL = "https://api.openrouteservice.org/v2/directions/{profile}/geojson"
 
 
@@ -124,6 +130,18 @@ def reading_at(hourly, moment):
     return cell("wind_speed_10m"), mm_to_inches(cell("rain")), cm_to_inches(cell("snowfall"))
 
 
+def _step_spans(properties):
+    spans = []
+    for segment in (properties or {}).get("segments") or []:
+        for step in segment.get("steps") or []:
+            way = step.get("way_points") or []
+            duration = step.get("duration")
+            if duration is None or len(way) < 2:
+                continue
+            spans.append((int(way[0]), int(way[1]), float(duration)))
+    return spans
+
+
 def routes_from_geojson(payload):
     routes = []
     for feature in payload.get("features") or []:
@@ -137,11 +155,19 @@ def routes_from_geojson(payload):
                 continue
             lng, lat = float(point[0]), float(point[1])
             coords.append((lat, lng))
-        summary = (feature.get("properties") or {}).get("summary") or {}
+        properties = feature.get("properties") or {}
+        summary = properties.get("summary") or {}
         duration = summary.get("duration")
         if duration is None or len(coords) < 2:
             continue
-        routes.append({"coords": coords, "duration_seconds": float(duration)})
+        duration = float(duration)
+        routes.append(
+            {
+                "coords": coords,
+                "duration_seconds": duration,
+                "time_at_coords": time_at_coords(coords, _step_spans(properties), duration),
+            }
+        )
         if len(routes) == 3:
             break
     return routes
@@ -160,53 +186,143 @@ def _ors_message(response):
     return "The routing service rejected the request."
 
 
-def ors_routes(origin, destination):
+def weight_tonnes(load_lb):
+    if load_lb is None:
+        return None
+    return round(float(load_lb) * LB_TO_TONNES, 2)
+
+
+def _trip_km(origin, destination):
+    miles = haversine_miles(
+        (origin["lat"], origin["lng"]),
+        (destination["lat"], destination["lng"]),
+    )
+    return miles * KM_PER_MILE
+
+
+def via_points(origin, destination):
+    """Four points beside the crow-flies line, so a long haul can leave the highway."""
+    mid_lat = (origin["lat"] + destination["lat"]) / 2
+    mid_lng = (origin["lng"] + destination["lng"]) / 2
+    north_km = (destination["lat"] - origin["lat"]) * 110.574
+    east_km = (destination["lng"] - origin["lng"]) * 111.320 * math.cos(math.radians(mid_lat))
+    length = math.hypot(north_km, east_km) or 1.0
+    side_east = -north_km / length
+    side_north = east_km / length
+    points = []
+    for fraction in (0.25, 0.45):
+        offset = length * fraction
+        for sign in (1, -1):
+            east = side_east * offset * sign
+            north = side_north * offset * sign
+            lat = mid_lat + north / 110.574
+            cosine = math.cos(math.radians(mid_lat)) or 1.0
+            lng = mid_lng + east / (111.320 * cosine)
+            points.append({"lat": lat, "lng": lng})
+    return points
+
+
+def _routes_differ(left, right):
+    samples = (0.2, 0.4, 0.6, 0.8)
+    gaps = []
+    for fraction in samples:
+        a = left[min(len(left) - 1, int(fraction * (len(left) - 1)))]
+        b = right[min(len(right) - 1, int(fraction * (len(right) - 1)))]
+        gaps.append(haversine_miles(a, b))
+    return sum(gaps) / len(gaps) > 5
+
+
+def _keep_distinct(kept, candidate):
+    for existing in kept:
+        if not _routes_differ(existing["coords"], candidate["coords"]):
+            return False
+    kept.append(candidate)
+    return True
+
+
+def _ors_body(coordinates, load_lb, alternatives):
+    body = {"coordinates": coordinates}
+    if alternatives:
+        body["alternative_routes"] = {
+            "target_count": 3,
+            "share_factor": 0.6,
+            "weight_factor": 1.4,
+        }
+    tonnes = weight_tonnes(load_lb)
+    if tonnes is not None:
+        body["options"] = {"profile_params": {"restrictions": {"weight": tonnes}}}
+    return body
+
+
+def _ors_headers(key):
+    return {
+        "Authorization": key,
+        "Content-Type": "application/json",
+        "Accept": "application/json, application/geo+json",
+    }
+
+
+def _ors_call(profile, coordinates, load_lb, key, alternatives):
+    """Returns (routes, status) where status is ok, refused, unauthorized, or error."""
+    response = requests.post(
+        ORS_URL.format(profile=profile),
+        json=_ors_body(coordinates, load_lb if profile == "driving-hgv" else None, alternatives),
+        headers=_ors_headers(key),
+        timeout=30,
+    )
+    if response.status_code in (400, 403, 404):
+        return [], "refused"
+    if response.status_code == 401:
+        return [], "unauthorized"
+    if response.status_code >= 400:
+        raise PlanError(_ors_message(response), status=502)
+    return routes_from_geojson(response.json()), "ok"
+
+
+def ors_routes(origin, destination, load_lb=None):
     key = os.environ.get("ORS_API_KEY", "").strip()
     if not key:
         raise PlanError(
             "ORS_API_KEY is not set. Add a free OpenRouteService key and restart.",
             status=500,
         )
-    body = {
-        "coordinates": [
-            [origin["lng"], origin["lat"]],
-            [destination["lng"], destination["lat"]],
-        ],
-        "alternative_routes": {
-            "target_count": 3,
-            "share_factor": 0.6,
-            "weight_factor": 1.4,
-        },
-    }
-    headers = {
-        "Authorization": key,
-        "Content-Type": "application/json",
-        "Accept": "application/json, application/geo+json",
-    }
-    try_car = False
-    for profile in ("driving-hgv", "driving-car"):
-        if profile == "driving-car" and not try_car:
-            break
-        response = requests.post(
-            ORS_URL.format(profile=profile),
-            json=body,
-            headers=headers,
-            timeout=30,
-        )
-        if profile == "driving-hgv" and response.status_code in (400, 403, 404):
-            try_car = True
-            continue
-        if response.status_code == 401:
+    direct = [
+        [origin["lng"], origin["lat"]],
+        [destination["lng"], destination["lat"]],
+    ]
+    profile = "driving-hgv"
+    routes, status = _ors_call(profile, direct, load_lb, key, alternatives=True)
+    if status == "unauthorized":
+        raise PlanError("OpenRouteService rejected the API key.", status=502)
+    if status == "refused" or not routes:
+        profile = "driving-car"
+        routes, status = _ors_call(profile, direct, None, key, alternatives=True)
+        if status == "unauthorized":
             raise PlanError("OpenRouteService rejected the API key.", status=502)
-        if response.status_code >= 400:
-            raise PlanError(_ors_message(response), status=502)
-        routes = routes_from_geojson(response.json())
-        if routes:
-            return routes
-        if profile == "driving-hgv":
-            try_car = True
-            continue
-    raise PlanError("No driving route was found between those places.", status=502)
+        if status == "refused":
+            raise PlanError("The routing service rejected the request.", status=502)
+    kept = []
+    for route in routes:
+        _keep_distinct(kept, route)
+    if _trip_km(origin, destination) > LONG_TRIP_KM and len(kept) < 3:
+        for via in via_points(origin, destination):
+            if len(kept) >= 3:
+                break
+            path = [
+                [origin["lng"], origin["lat"]],
+                [via["lng"], via["lat"]],
+                [destination["lng"], destination["lat"]],
+            ]
+            try:
+                extra, extra_status = _ors_call(profile, path, load_lb, key, alternatives=False)
+            except PlanError:
+                continue
+            if extra_status != "ok" or not extra:
+                continue
+            _keep_distinct(kept, extra[0])
+    if not kept:
+        raise PlanError("No driving route was found between those places.", status=502)
+    return kept[:3]
 
 
 def nominatim_search(query):
@@ -311,14 +427,20 @@ def build_plan(payload, fetch_routes, fetch_weather):
     if abs(origin["lat"] - destination["lat"]) < 1e-5 and abs(origin["lng"] - destination["lng"]) < 1e-5:
         raise PlanError("Origin and destination are the same place.")
 
-    raw_routes = fetch_routes(origin, destination) or []
+    raw_routes = fetch_routes(origin, destination, load_lb) or []
     drafts = []
     for raw in raw_routes[:3]:
         coords = raw.get("coords") or []
         if len(coords) < 2:
             continue
         duration = float(raw["duration_seconds"])
-        checkpoints = place_checkpoints(coords, spacing, departure, duration)
+        checkpoints = place_checkpoints(
+            coords,
+            spacing,
+            departure,
+            duration,
+            raw.get("time_at_coords"),
+        )
         drafts.append(
             {
                 "coords": coords,
@@ -395,6 +517,9 @@ def build_plan(payload, fetch_routes, fetch_weather):
             }
         )
     rank_routes(routes)
+    reason = recommendation_reason(routes)
+    for route in routes:
+        route["recommendation_reason"] = reason if route["recommended"] else None
 
     corridor_out = []
     for lat, lng in corridor:
@@ -427,6 +552,7 @@ def _public_route(route):
     return {
         "id": route["id"],
         "recommended": route["recommended"],
+        "recommendation_reason": route.get("recommendation_reason"),
         "distance_miles": _round(route["distance_miles"], 2),
         "duration_seconds": round(route["duration_seconds"]),
         "arrival": route["arrival"].isoformat(),

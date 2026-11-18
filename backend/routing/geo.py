@@ -57,9 +57,68 @@ def eta_at(departure, duration_seconds, mile, total):
     return departure + timedelta(seconds=duration_seconds * fraction)
 
 
-def place_checkpoints(coords, spacing_miles, departure, duration_seconds):
+def time_at_coords(coords, spans, total_duration):
+    """Seconds from the start of the route at each coordinate.
+
+    `spans` are ORS step records (start index, end index, duration seconds).
+    Duration is spread along each step by distance. With no steps, time follows
+    distance across the whole route.
+    """
+    count = len(coords)
+    if count == 0:
+        return []
+    miles = cumulative_miles(coords)
+    if not spans:
+        total = miles[-1]
+        if total <= 0:
+            return [0.0] * count
+        return [total_duration * (mile / total) for mile in miles]
+
+    seconds = [None] * count
+    seconds[0] = 0.0
+    for start, end, duration in spans:
+        start = max(0, min(count - 1, int(start)))
+        end = max(0, min(count - 1, int(end)))
+        if end < start:
+            start, end = end, start
+        base = seconds[start] if seconds[start] is not None else 0.0
+        if end == start:
+            seconds[start] = base + float(duration)
+            continue
+        piece = cumulative_miles(coords[start : end + 1])
+        span_miles = piece[-1]
+        for offset, mile in enumerate(piece):
+            fraction = 0.0 if span_miles == 0 else mile / span_miles
+            seconds[start + offset] = base + float(duration) * fraction
+    last = 0.0
+    for index in range(count):
+        if seconds[index] is None or seconds[index] < last:
+            seconds[index] = last
+        last = seconds[index]
+    return seconds
+
+
+def seconds_at_mile(coords, seconds, mile):
+    miles = cumulative_miles(coords)
+    if not miles:
+        return 0.0
+    if mile <= 0:
+        return seconds[0]
+    if mile >= miles[-1]:
+        return seconds[-1]
+    for index in range(1, len(miles)):
+        if miles[index] >= mile:
+            span = miles[index] - miles[index - 1]
+            fraction = 0.0 if span == 0 else (mile - miles[index - 1]) / span
+            return seconds[index - 1] + fraction * (seconds[index] - seconds[index - 1])
+    return seconds[-1]
+
+
+def place_checkpoints(coords, spacing_miles, departure, duration_seconds, time_seconds=None):
     miles = cumulative_miles(coords)
     total = miles[-1]
+    if time_seconds is None or len(time_seconds) != len(coords):
+        time_seconds = time_at_coords(coords, [], duration_seconds)
     placed = []
     for mile in sample_miles(total, spacing_miles):
         lat, lng = point_at_mile(coords, miles, mile)
@@ -68,7 +127,7 @@ def place_checkpoints(coords, spacing_miles, departure, duration_seconds):
                 "mile": mile,
                 "lat": lat,
                 "lng": lng,
-                "eta": eta_at(departure, duration_seconds, mile, total),
+                "eta": departure + timedelta(seconds=seconds_at_mile(coords, time_seconds, mile)),
             }
         )
     return placed

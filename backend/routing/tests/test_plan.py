@@ -36,7 +36,7 @@ def weather_factory(wind_for_lat, rain_mm=0.0, snow_cm=0.0, times=None):
     return fetch
 
 
-def two_routes(_origin, _destination):
+def two_routes(_origin, _destination, _load_lb=None):
     return [
         {"coords": [(10.0, 0.0), (10.0, 1.0)], "duration_seconds": 1000},
         {"coords": [(1.0, 0.0), (1.0, 1.0)], "duration_seconds": 5000},

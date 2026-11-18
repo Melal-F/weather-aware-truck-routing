@@ -1,9 +1,19 @@
 import json
+import os
 from unittest.mock import patch
 
-from django.test import Client, SimpleTestCase
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+
+import django
+from django.conf import settings
+
+if not settings.configured:
+    django.setup()
+
+from django.test import Client, SimpleTestCase, override_settings
 
 
+@override_settings(ALLOWED_HOSTS=["testserver", "localhost", "127.0.0.1"])
 class PlanApiTest(SimpleTestCase):
     def test_missing_key_is_a_clear_error(self):
         response = Client().post(

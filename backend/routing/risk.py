@@ -113,6 +113,42 @@ def average_risk(miles):
     return sum(RANK[name] * miles[name] for name in LEVELS) / total
 
 
+def recommendation_reason(routes):
+    """Why the recommended route won, using the first sort key that separates it."""
+    winner = next((route for route in routes if route.get("recommended")), None)
+    if winner is None:
+        return None
+    others = [route for route in routes if route is not winner]
+    if not others:
+        return "Only route returned."
+
+    def average(route):
+        value = route.get("average_risk")
+        return UNSCORED_AVERAGE if value is None else value
+
+    checks = (
+        (
+            lambda route: route["miles"]["No Travel"],
+            "fewest miles that are No Travel",
+        ),
+        (
+            lambda route: route["miles"]["Severe"],
+            "fewest Severe miles",
+        ),
+        (
+            lambda route: route["miles"]["High"],
+            "fewest High miles",
+        ),
+        (average, "lowest average risk"),
+        (lambda route: route["duration_seconds"], "shortest travel time"),
+    )
+    for measure, phrase in checks:
+        best = measure(winner)
+        if best < min(measure(route) for route in others) - 1e-9:
+            return f"Recommended for the {phrase}."
+    return "Tied on risk and time; kept the first route the routing service returned."
+
+
 def rank_routes(routes):
     """Mark exactly one route recommended. Lowest tuple wins.
 
