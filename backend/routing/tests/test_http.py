@@ -1,7 +1,11 @@
 import os
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+
+import requests
 
 from routing.geo import cumulative_miles, haversine_miles, place_checkpoints
 from routing.services import (
@@ -59,9 +63,10 @@ class ViaFallbackTest(unittest.TestCase):
             body = json or {}
             if "alternative_routes" in body:
                 return _response(400, {"error": {"message": "Request parameters exceed the server configuration."}})
-            shift = 0.35 * post.call_count
+            coords = body.get("coordinates") or []
+            shift = 0.0 if len(coords) < 3 else coords[1][0] - coords[0][0]
             line = [[lng + shift, lat] for lng, lat in direct]
-            return _response(200, {"features": [_feature(line, 4000 + shift * 100)]})
+            return _response(200, {"features": [_feature(line, 4000 + abs(shift) * 100)]})
 
         post.side_effect = post_json
         routes = ors_routes(origin, destination, load_lb=42000)
@@ -80,6 +85,139 @@ class ViaFallbackTest(unittest.TestCase):
         self.assertGreaterEqual(len(via_bodies), 2)
         self.assertEqual(via_bodies[0]["radiuses"], [-1, -1, -1])
         self.assertEqual(len({round(route["coords"][1][1], 2) for route in routes}), 3)
+
+
+def _shifted_line(coordinates):
+    start = coordinates[0]
+    end = coordinates[-1]
+    shift = 0.0 if len(coordinates) < 3 else coordinates[1][0] - start[0]
+    middle = [start[0], (start[1] + end[1]) / 2]
+    line = [[lng + shift, lat] for lng, lat in (start, middle, end)]
+    coords = [(lat, lng) for lng, lat in line]
+    return line, coords, 5000.0 + abs(shift) * 100
+
+
+def _is_via(coordinates, via):
+    return (
+        len(coordinates) == 3
+        and abs(coordinates[1][0] - via["lng"]) < 1e-9
+        and abs(coordinates[1][1] - via["lat"]) < 1e-9
+    )
+
+
+_NORTH = {"name": "North", "lat": 41.88, "lng": -87.63}
+_SOUTH = {"name": "South", "lat": 40.58, "lng": -87.63}
+
+
+def _via_path(via=None):
+    path = [[_NORTH["lng"], _NORTH["lat"]], [_SOUTH["lng"], _SOUTH["lat"]]]
+    if via is not None:
+        path.insert(1, [via["lng"], via["lat"]])
+    return path
+
+
+class ConcurrentViaTest(unittest.TestCase):
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_via_requests_overlap_and_keep_via_order(self, post):
+        vias = via_points(_NORTH, _SOUTH)
+        fast = vias[2]
+        finished = []
+        lock = threading.Lock()
+
+        def post_json(url, json=None, headers=None, timeout=None):
+            body = json or {}
+            coords = body["coordinates"]
+            self.assertNotIn("alternative_routes", body)
+            self.assertEqual(timeout, 15)
+            if len(coords) == 3:
+                time.sleep(0.01 if _is_via(coords, fast) else 0.2)
+                with lock:
+                    finished.append(coords[1][0])
+            line, _route_coords, duration = _shifted_line(coords)
+            return _response(200, {"features": [_feature(line, duration)]})
+
+        post.side_effect = post_json
+        started = time.perf_counter()
+        routes = ors_routes(_NORTH, _SOUTH, load_lb=42000)
+        elapsed = time.perf_counter() - started
+        print(f"MEASURE via_elapsed={elapsed:.4f}", flush=True)
+        self.assertLess(elapsed, 0.6)
+        self.assertEqual(len(routes), 3)
+        self.assertEqual(post.call_count, 7)
+        self.assertEqual(finished[0], fast["lng"])
+        expected = [_shifted_line(_via_path(via))[1] for via in (None, vias[0], vias[1])]
+        self.assertEqual([route["coords"] for route in routes], expected)
+
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_timed_out_via_is_skipped(self, post):
+        vias = via_points(_NORTH, _SOUTH)
+        missed = vias[1]
+
+        def post_json(url, json=None, headers=None, timeout=None):
+            coords = (json or {})["coordinates"]
+            if _is_via(coords, missed):
+                raise requests.Timeout("timed out")
+            line, _route_coords, duration = _shifted_line(coords)
+            return _response(200, {"features": [_feature(line, duration)]})
+
+        post.side_effect = post_json
+        routes = ors_routes(_NORTH, _SOUTH, load_lb=42000)
+        self.assertEqual(len(routes), 3)
+        expected = [_shifted_line(_via_path(via))[1] for via in (None, vias[0], vias[2])]
+        self.assertEqual([route["coords"] for route in routes], expected)
+        missed_coords = _shifted_line(_via_path(missed))[1]
+        self.assertTrue(all(route["coords"] != missed_coords for route in routes))
+
+
+class ConcurrentWeatherTest(unittest.TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    @patch("routing.services.requests.get")
+    def test_chunks_overlap_and_stay_in_point_order(self, get):
+        points = [(round(30 + i / 100, 5), round(-100 - i / 100, 5)) for i in range(250)]
+
+        def forecast(url, params=None, timeout=None):
+            self.assertIn("open-meteo.com", url)
+            self.assertEqual(timeout, 20)
+            time.sleep(0.2)
+            lats = [float(part) for part in str(params["latitude"]).split(",") if part]
+            times = _hours()
+            count = len(times)
+            rows = []
+            for lat in lats:
+                rows.append(
+                    {
+                        "hourly": {
+                            "time": times,
+                            "wind_speed_10m": [lat] * count,
+                            "rain": [0.0] * count,
+                            "showers": [0.0] * count,
+                            "snowfall": [0.0] * count,
+                        }
+                    }
+                )
+            payload = rows[0] if len(rows) == 1 else rows
+            return _response(200, payload)
+
+        get.side_effect = forecast
+        start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        started = time.perf_counter()
+        results = open_meteo(points, start, start + timedelta(days=2))
+        elapsed = time.perf_counter() - started
+        print(f"MEASURE weather_elapsed={elapsed:.4f}", flush=True)
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(len(results), len(points))
+        self.assertEqual(get.call_count, 3)
+        self.assertTrue(all("open-meteo.com" in call.args[0] for call in get.call_args_list))
+        sizes = sorted(len(call.kwargs["params"]["latitude"].split(",")) for call in get.call_args_list)
+        self.assertEqual(sizes, [50, 100, 100])
+        for index, (lat, _lng) in enumerate(points):
+            self.assertEqual(results[index]["wind_speed_10m"][0], float(f"{lat:.5f}"))
 
 
 class StepEtaTest(unittest.TestCase):
@@ -229,6 +367,9 @@ def _one_route(_origin, _destination, _load_lb=None):
 class ShowerRainTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        from django.core.cache import cache
+
+        cache.clear()
         patcher = patch(
             "routing.services._utcnow",
             return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
@@ -334,11 +475,15 @@ class ShowerRainTest(unittest.TestCase):
             return _response(200, payloads.pop(0))
 
         get.side_effect = forecast
+        from django.core.cache import cache
+
         start = datetime(2026, 11, 18, tzinfo=timezone.utc)
         end = start + timedelta(days=1)
         point = [(41.0, -87.6)]
         self.assertEqual(open_meteo(point, start, end)[0]["rain"], [15.0, 0.0, 4.0])
+        cache.clear()
         self.assertEqual(open_meteo(point, start, end)[0]["rain"], [None, 15.0])
+        cache.clear()
         self.assertEqual(open_meteo(point, start, end)[0]["rain"], [])
 
 
