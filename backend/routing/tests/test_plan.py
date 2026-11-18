@@ -1,8 +1,19 @@
+import copy
+import json
+import math
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from routing.services import PlanError, build_plan, parse_departure, routes_from_geojson
+from routing.geo import (
+    EARTH_MILES,
+    color_segments,
+    cumulative_miles,
+    haversine_miles,
+    place_checkpoints,
+)
+from routing.risk import classify, miles_by_level
+from routing.services import PlanError, build_plan, open_meteo, parse_departure, routes_from_geojson
 
 
 DEPARTURE = "2026-11-18T12:30:00+00:00"
@@ -56,9 +67,62 @@ def payload(**overrides):
     return body
 
 
+def _response(status, body):
+    class Response:
+        status_code = status
+
+        def json(self):
+            return body
+
+    return Response()
+
+
+def _meridian(lat, lng, miles, steps):
+    span = miles / (EARTH_MILES * math.pi / 180.0)
+    return [(lat + span * index / steps, lng) for index in range(steps + 1)]
+
+
+def _distance_to_meridian(point, lat0, lat1, lng):
+    lat = point[0]
+    if lat <= lat0:
+        return haversine_miles(point, (lat0, lng))
+    if lat >= lat1:
+        return haversine_miles(point, (lat1, lng))
+    return haversine_miles(point, (lat, lng))
+
+
+def _coords_6000():
+    corners = []
+    lat, lng = 35.0, -102.0
+    for index in range(15):
+        corners.append((lat, lng))
+        if index % 2 == 0:
+            lng += 0.8
+        else:
+            lat += 0.7
+    segments = len(corners) - 1
+    steps_total = 5999
+    base, extra = divmod(steps_total, segments)
+    coords = [corners[0]]
+    for index, (start, end) in enumerate(zip(corners, corners[1:])):
+        steps = base + (1 if index < extra else 0)
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            coords.append(
+                (
+                    start[0] + fraction * (end[0] - start[0]),
+                    start[1] + fraction * (end[1] - start[1]),
+                )
+            )
+    return coords
+
+
 class BuildPlanTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        from django.core.cache import cache
+
+        cache.clear()
         patcher = patch(
             "routing.services._utcnow",
             return_value=datetime(2026, 11, 18, 11, 0, tzinfo=timezone.utc),
@@ -145,6 +209,138 @@ class BuildPlanTest(unittest.TestCase):
             build_plan(payload(origin={"name": "Yard", "lat": 1, "lng": 1}, destination={"name": "Dock", "lat": 1, "lng": 1}), None, None)
         with self.assertRaises(PlanError):
             build_plan(payload(departure="tomorrow"), None, None)
+
+    def test_short_north_south_corridor_has_no_holes(self):
+        coords = _meridian(34.0, -90.0, 300, 300)
+        requested = []
+
+        def fetch(points, start, end):
+            requested.extend(points)
+            return weather_factory(lambda _lat: 5.0)(points, start, end)
+
+        def routes(_origin, _destination, _load_lb=None):
+            return [{"coords": coords, "duration_seconds": 5 * 3600}]
+
+        plan = build_plan(
+            payload(
+                origin={"name": "South yard", "lat": 34.0, "lng": -90.0},
+                destination={"name": "North dock", "lat": coords[-1][0], "lng": -90.0},
+                spacing_miles=25,
+            ),
+            routes,
+            fetch,
+        )
+        self.assertEqual(plan["corridor_cell_deg"], 0.2)
+        self.assertLessEqual(len(set(requested)), 350)
+        present = {(point["lat"], point["lng"]) for point in plan["corridor"]}
+        lat0, lat1 = coords[0][0], coords[-1][0]
+        deg = 0.2
+        missing = []
+        i0 = math.floor((lat0 - 1) / deg) - 1
+        i1 = math.floor((lat1 + 1) / deg) + 2
+        j0 = math.floor((-91) / deg) - 1
+        j1 = math.floor((-89) / deg) + 2
+        for i in range(i0, i1):
+            for j in range(j0, j1):
+                center = ((i + 0.5) * deg, (j + 0.5) * deg)
+                if _distance_to_meridian(center, lat0, lat1, -90.0) > 20:
+                    continue
+                rounded = (round(center[0], 5), round(center[1], 5))
+                if rounded not in present:
+                    missing.append(rounded)
+        self.assertEqual(missing, [])
+
+    @patch("routing.services.requests.get")
+    def test_long_trip_uses_coarser_cells_under_the_weather_cap(self, get):
+        sent = []
+        hours = hours_from(datetime(2026, 11, 18, tzinfo=timezone.utc), 96)
+
+        def forecast(url, params=None, timeout=None):
+            lats = [part for part in str(params["latitude"]).split(",") if part]
+            lngs = [part for part in str(params["longitude"]).split(",") if part]
+            sent.extend(zip(lats, lngs))
+            count = len(hours)
+            rows = []
+            for _lat in lats:
+                rows.append(
+                    {
+                        "hourly": {
+                            "time": hours,
+                            "wind_speed_10m": [8.0] * count,
+                            "rain": [0.0] * count,
+                            "showers": [0.0] * count,
+                            "snowfall": [0.0] * count,
+                        }
+                    }
+                )
+            return _response(200, rows[0] if len(rows) == 1 else rows)
+
+        get.side_effect = forecast
+
+        def routes(_origin, _destination, _load_lb=None):
+            return [
+                {"coords": _meridian(32.0, lng, 900, 80), "duration_seconds": 18 * 3600}
+                for lng in (-100.0, -98.0, -96.0)
+            ]
+
+        plan = build_plan(
+            payload(
+                origin={"name": "South yard", "lat": 32.0, "lng": -100.0},
+                destination={"name": "North dock", "lat": 45.0, "lng": -96.0},
+                spacing_miles=25,
+                load_lb=42000,
+            ),
+            routes,
+            open_meteo,
+        )
+        self.assertEqual(len(plan["routes"]), 3)
+        self.assertIn(plan["corridor_cell_deg"], (0.25, 0.3))
+        self.assertLessEqual(len(set(sent)), 350)
+        self.assertTrue(plan["corridor"])
+        for route in plan["routes"]:
+            self.assertTrue(route["checkpoints"])
+            self.assertIsNotNone(route["checkpoints"][0]["wind_mph"])
+
+    def test_simplified_display_keeps_full_route_miles(self):
+        coords = _coords_6000()
+        self.assertEqual(len(coords), 6000)
+        duration = 10 * 3600
+
+        def routes(_origin, _destination, _load_lb=None):
+            return [{"coords": coords, "duration_seconds": duration}]
+
+        plan = build_plan(
+            payload(
+                origin={"name": "West yard", "lat": 35.0, "lng": -102.0},
+                destination={"name": "East dock", "lat": 40.0, "lng": -96.0},
+                spacing_miles=50,
+                load_lb=1000,
+            ),
+            routes,
+            weather_factory(lambda _lat: 5.0),
+        )
+        positions = sum(len(segment["positions"]) for segment in plan["routes"][0]["segments"])
+        self.assertLess(positions, 1500)
+        full = cumulative_miles(coords)[-1]
+        self.assertAlmostEqual(plan["routes"][0]["distance_miles"], full, delta=0.01)
+        departure = datetime(2026, 11, 18, 12, 30, tzinfo=timezone.utc)
+        placed = place_checkpoints(coords, 50, departure, duration)
+        for point in placed:
+            point.update(classify(5.0, 0.0, 0.0, 1000))
+        expected = miles_by_level(placed)
+        for name, amount in expected.items():
+            self.assertAlmostEqual(plan["routes"][0]["miles"][name], amount, delta=0.01)
+        before_plan = copy.deepcopy(plan)
+        before_plan["routes"][0]["segments"] = [
+            {
+                "level": segment["level"],
+                "positions": [[round(lat, 5), round(lng, 5)] for lat, lng in segment["positions"]],
+            }
+            for segment in color_segments(coords, placed)
+        ]
+        before = len(json.dumps(before_plan))
+        after = len(json.dumps(plan))
+        self.assertLess(after, before)
 
 
 class GeoJsonTest(unittest.TestCase):

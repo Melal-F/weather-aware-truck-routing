@@ -10,13 +10,13 @@ import requests
 from django.core.cache import cache
 
 from routing.geo import (
-    CORRIDOR_CELL_DEG,
     _thin,
     color_segments,
     corridor_samples,
     cumulative_miles,
     haversine_miles,
     place_checkpoints,
+    simplify,
     time_at_coords,
 )
 from routing.risk import (
@@ -559,6 +559,38 @@ def _route_note(count):
     return f"The routing service returned {count} {noun}."
 
 
+def _extra_weather_keys(cells, checkpoint_keys):
+    seen = set(checkpoint_keys)
+    extra = 0
+    for lat, lng in cells:
+        key = weather_key(lat, lng)
+        if key in seen:
+            continue
+        seen.add(key)
+        extra += 1
+    return extra
+
+
+def _corridor_for_budget(routes, checkpoint_keys):
+    """0.2°, then 0.25°, then 0.3°. Thin the 0.3° cells only if that grid is still over budget."""
+    chosen_deg = 0.2
+    chosen_cells = []
+    for deg in (0.2, 0.25, 0.3):
+        cells = corridor_samples(routes, deg)
+        chosen_deg = deg
+        chosen_cells = cells
+        if len(checkpoint_keys) + _extra_weather_keys(cells, checkpoint_keys) <= MAX_WEATHER_LOCATIONS:
+            return deg, cells
+    if len(checkpoint_keys) > MAX_WEATHER_LOCATIONS:
+        logger.warning(
+            "Checkpoint weather cells (%s) exceed %s; corridor forecast skipped",
+            len(checkpoint_keys),
+            MAX_WEATHER_LOCATIONS,
+        )
+    budget = MAX_WEATHER_LOCATIONS - len(checkpoint_keys)
+    return chosen_deg, _thin(chosen_cells, budget)
+
+
 def build_plan(payload, fetch_routes, fetch_weather):
     if not isinstance(payload, dict):
         raise PlanError("Request body must be a JSON object.")
@@ -606,25 +638,18 @@ def build_plan(payload, fetch_routes, fetch_weather):
             seen_checkpoints.add(key)
             checkpoint_keys.append(key)
 
-    corridor_keys = []
-    seen_corridor = set()
-    for lat, lng in corridor_samples([draft["coords"] for draft in drafts], spacing):
+    corridor_deg, corridor_cells = _corridor_for_budget(
+        [draft["coords"] for draft in drafts],
+        checkpoint_keys,
+    )
+    points = list(checkpoint_keys)
+    seen_points = set(checkpoint_keys)
+    for lat, lng in corridor_cells:
         key = weather_key(lat, lng)
-        if key in seen_checkpoints or key in seen_corridor:
+        if key in seen_points:
             continue
-        seen_corridor.add(key)
-        corridor_keys.append(key)
-    if len(checkpoint_keys) > MAX_WEATHER_LOCATIONS:
-        logger.warning(
-            "Checkpoint weather cells (%s) exceed %s; corridor forecast skipped",
-            len(checkpoint_keys),
-            MAX_WEATHER_LOCATIONS,
-        )
-        corridor_keys = []
-    elif len(checkpoint_keys) + len(corridor_keys) > MAX_WEATHER_LOCATIONS:
-        corridor_keys = _thin(corridor_keys, MAX_WEATHER_LOCATIONS - len(checkpoint_keys))
-
-    points = checkpoint_keys + corridor_keys
+        seen_points.add(key)
+        points.append(key)
     start = floor_hour(departure)
     latest = max(checkpoint["eta"] for draft in drafts for checkpoint in draft["checkpoints"])
     end = floor_hour(max(departure + timedelta(hours=48), latest))
@@ -671,7 +696,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
                 "distance_miles": draft["distance_miles"],
                 "arrival": draft["checkpoints"][-1]["eta"],
                 "checkpoints": checkpoints,
-                "segments": color_segments(draft["coords"], checkpoints),
+                "segments": color_segments(simplify(draft["coords"]), checkpoints),
                 "miles": miles,
                 "average_risk": average_risk(miles),
                 "profile": draft.get("profile"),
@@ -683,21 +708,21 @@ def build_plan(payload, fetch_routes, fetch_weather):
         route["recommendation_reason"] = reason if route["recommended"] else None
 
     corridor_out = []
-    for lat, lng in corridor_keys:
+    for lat, lng in corridor_cells:
         risks = []
         for hour in range(FORECAST_HOURS):
             wind, rain, snow = weather(lat, lng, start + timedelta(hours=hour))
             risks.append(classify(wind, rain, snow, load_lb)["level"])
-        corridor_out.append({"lat": lat, "lng": lng, "risks": risks})
+        corridor_out.append({"lat": round(lat, 5), "lng": round(lng, 5), "risks": risks})
 
     return {
         "departure": departure.isoformat(),
         "forecast_start": start.isoformat(),
         "load_lb": load_lb,
         "spacing_miles": spacing,
-        "corridor_cell_deg": CORRIDOR_CELL_DEG,
-        "origin": origin,
-        "destination": destination,
+        "corridor_cell_deg": corridor_deg,
+        "origin": _public_place(origin),
+        "destination": _public_place(destination),
         "note": _route_note(len(routes)),
         "routes": [_public_route(route) for route in routes],
         "corridor": corridor_out,
@@ -708,6 +733,10 @@ def _round(value, places):
     if value is None:
         return None
     return round(value, places)
+
+
+def _public_place(place):
+    return {"name": place["name"], "lat": round(place["lat"], 5), "lng": round(place["lng"], 5)}
 
 
 def _public_route(route):
@@ -724,8 +753,8 @@ def _public_route(route):
         "checkpoints": [
             {
                 "mile": round(point["mile"], 2),
-                "lat": point["lat"],
-                "lng": point["lng"],
+                "lat": round(point["lat"], 5),
+                "lng": round(point["lng"], 5),
                 "eta": point["eta"].isoformat(),
                 "wind_mph": _round(point["wind_mph"], 1),
                 "rain_in_hr": _round(point["rain_in_hr"], 3),
@@ -737,5 +766,11 @@ def _public_route(route):
             }
             for point in route["checkpoints"]
         ],
-        "segments": route["segments"],
+        "segments": [
+            {
+                "level": segment["level"],
+                "positions": [[round(lat, 5), round(lng, 5)] for lat, lng in segment["positions"]],
+            }
+            for segment in route["segments"]
+        ],
     }

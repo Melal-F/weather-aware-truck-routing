@@ -140,11 +140,18 @@ def _with_miles(coords):
     return [{"lat": lat, "lng": lng, "mile": mile} for (lat, lng), mile in zip(coords, miles)]
 
 
+def _points_with_miles(coords):
+    """(lat, lng) recomputes miles. (lat, lng, mile) keeps miles from the original route."""
+    if coords and len(coords[0]) >= 3:
+        return [{"lat": point[0], "lng": point[1], "mile": point[2]} for point in coords]
+    return _with_miles(coords)
+
+
 def color_segments(coords, checkpoints):
     """Split the path so each piece carries the worse level of the checkpoints that bound it."""
     if len(coords) < 2 or not checkpoints:
         return []
-    points = _with_miles(coords)
+    points = _points_with_miles(coords)
     existing = {round(point["mile"], 4) for point in points}
     for checkpoint in checkpoints:
         key = round(checkpoint["mile"], 4)
@@ -181,8 +188,51 @@ def color_segments(coords, checkpoints):
 
 
 MILES_PER_DEG_LAT = EARTH_MILES * math.pi / 180.0
-CORRIDOR_SIDE_MILES = (10, 20)
-CORRIDOR_CELL_DEG = 0.2
+
+
+def _segment_distance_miles(point, start, end):
+    """Perpendicular distance in equirectangular miles."""
+    lat0 = (point[0] + start[0] + end[0]) / 3.0
+    scale_x = MILES_PER_DEG_LAT * math.cos(math.radians(lat0))
+    px, py = point[1] * scale_x, point[0] * MILES_PER_DEG_LAT
+    ax, ay = start[1] * scale_x, start[0] * MILES_PER_DEG_LAT
+    bx, by = end[1] * scale_x, end[0] * MILES_PER_DEG_LAT
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / length_sq
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def simplify(coords, tolerance_miles=0.03):
+    """Douglas–Peucker. Each kept vertex is (lat, lng, mile) with mile along the original route."""
+    # ponytail: O(n^2) scan, radial-distance prefilter if routes pass ~20k points.
+    miles = cumulative_miles(coords)
+    count = len(coords)
+    if count <= 2:
+        return [(lat, lng, mile) for (lat, lng), mile in zip(coords, miles)]
+    keep = [False] * count
+    keep[0] = keep[-1] = True
+    stack = [(0, count - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        max_dist = 0.0
+        index = None
+        first, last = coords[start], coords[end]
+        for cursor in range(start + 1, end):
+            dist = _segment_distance_miles(coords[cursor], first, last)
+            if dist > max_dist:
+                max_dist = dist
+                index = cursor
+        if index is not None and max_dist > tolerance_miles:
+            keep[index] = True
+            stack.append((start, index))
+            stack.append((index, end))
+    return [(coords[i][0], coords[i][1], miles[i]) for i in range(count) if keep[i]]
 
 
 def _thin(points, cap):
@@ -196,63 +246,41 @@ def _thin(points, cap):
     return [points[round(index * step)] for index in range(cap)]
 
 
-def _segment_heading(coords, miles, target):
-    if target <= 0:
-        start, end = coords[0], coords[1]
-    elif target >= miles[-1]:
-        start, end = coords[-2], coords[-1]
-    else:
-        start, end = coords[0], coords[1]
-        for index in range(1, len(miles)):
-            if miles[index] >= target:
-                start, end = coords[index - 1], coords[index]
-                break
-    mid_lat = (start[0] + end[0]) / 2
-    north = (end[0] - start[0]) * MILES_PER_DEG_LAT
-    east = (end[1] - start[1]) * MILES_PER_DEG_LAT * math.cos(math.radians(mid_lat))
-    return east, north
+def _cell_index(value, deg):
+    scaled = value / deg
+    nearest = round(scaled)
+    # Binary division lands a hair off exact integers (cell edges).
+    if abs(scaled - nearest) <= 1e-8:
+        scaled = nearest
+    return math.floor(scaled)
 
 
-def _side_point(lat, lng, east, north, distance, sign):
-    length = math.hypot(east, north) or 1.0
-    offset_east = -north / length * distance * sign
-    offset_north = east / length * distance * sign
-    cosine = math.cos(math.radians(lat)) or 1.0
-    return (
-        lat + offset_north / MILES_PER_DEG_LAT,
-        lng + offset_east / (MILES_PER_DEG_LAT * cosine),
-    )
+def corridor_samples(routes, deg):
+    """Cell centers within 22 miles of a point every 6 miles along each route.
 
-
-def _corridor_cell(value):
-    return round(round(value / CORRIDOR_CELL_DEG) * CORRIDOR_CELL_DEG, 1)
-
-
-def corridor_samples(routes, spacing_miles=None, cap=600, step_miles=12):
-    """Centerline every step_miles, plus points 10 and 20 miles to each side.
-
-    spacing_miles is accepted so callers keep working and is ignored.
-    Every point is snapped to a CORRIDOR_CELL_DEG cell and deduped.
+    A cell's center is ((i + 0.5) * deg, (j + 0.5) * deg) for the cell
+    i = floor(lat/deg), j = floor(lng/deg). At each step the 5×5 neighbourhood
+    around the cell that contains the point is considered. Cells are deduped
+    across steps and routes.
     """
-    snapped = []
+    centers = []
     seen = set()
     for coords in routes:
         if len(coords) < 2:
             continue
         miles = cumulative_miles(coords)
-        for mile in sample_miles(miles[-1], step_miles):
+        for mile in sample_miles(miles[-1], 6):
             lat, lng = point_at_mile(coords, miles, mile)
-            east, north = _segment_heading(coords, miles, mile)
-            raw_points = [(lat, lng)]
-            for distance in CORRIDOR_SIDE_MILES:
-                for sign in (1, -1):
-                    raw_points.append(_side_point(lat, lng, east, north, distance, sign))
-            for raw_lat, raw_lng in raw_points:
-                cell = (_corridor_cell(raw_lat), _corridor_cell(raw_lng))
-                if cell in seen:
-                    continue
-                seen.add(cell)
-                snapped.append(cell)
-    if len(snapped) > cap:
-        return _thin(snapped, cap)
-    return snapped
+            base_i = _cell_index(lat, deg)
+            base_j = _cell_index(lng, deg)
+            for di in range(-2, 3):
+                for dj in range(-2, 3):
+                    cell = (base_i + di, base_j + dj)
+                    if cell in seen:
+                        continue
+                    center = ((cell[0] + 0.5) * deg, (cell[1] + 0.5) * deg)
+                    if haversine_miles((lat, lng), center) > 22:
+                        continue
+                    seen.add(cell)
+                    centers.append(center)
+    return centers

@@ -4,8 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 from routing.geo import (
     EARTH_MILES,
-    _segment_heading,
-    _side_point,
     color_segments,
     corridor_samples,
     cumulative_miles,
@@ -13,6 +11,7 @@ from routing.geo import (
     place_checkpoints,
     point_at_mile,
     sample_miles,
+    simplify,
 )
 from routing.risk import LEVELS, miles_by_level
 
@@ -94,41 +93,69 @@ class PlaceCheckpointsTest(unittest.TestCase):
         for name in LEVELS:
             self.assertAlmostEqual(colored[name], expected[name], delta=0.01)
 
-    def test_corridor_cap(self):
-        coords = [(0.0, mile / 69.0) for mile in range(0, 400)]
-        sampled = corridor_samples([coords, coords], spacing_miles=10, cap=30)
-        self.assertEqual(len(sampled), 30)
-
-    def test_north_south_route_offsets_side_points(self):
-        route = [(40.0, -90.0), (41.0, -90.0)]
-        sampled = corridor_samples([route], spacing_miles=30)
-        self.assertEqual(sampled, corridor_samples([route], spacing_miles=10))
-        cell = 0.2
-
-        def center(value):
-            return round(round(value / cell) * cell, 1)
-
-        for lat, lng in sampled:
-            self.assertAlmostEqual(lat, center(lat), places=5)
-            self.assertAlmostEqual(lng, center(lng), places=5)
-        centers = [point for point in sampled if abs(point[1] + 90) < 1e-6]
-        self.assertGreaterEqual(len(centers), 2)
-        self.assertTrue(any(point[1] < -90 for point in sampled))
-        self.assertTrue(any(point[1] > -90 for point in sampled))
-
+    def test_corridor_uses_cell_centers_within_22_miles(self):
+        route = [(40.0, -90.0), (41.5, -90.0)]
+        sampled = corridor_samples([route], 0.2)
+        self.assertEqual(sampled, corridor_samples([route, route], 0.2))
+        self.assertGreaterEqual(len(sampled), 2)
         miles = cumulative_miles(route)
-        marks = sample_miles(miles[-1], 12)
-        target = marks[len(marks) // 2]
-        lat, lng = point_at_mile(route, miles, target)
-        east, north = _segment_heading(route, miles, target)
-        for distance in (10, 20):
-            for sign in (1, -1):
-                raw = _side_point(lat, lng, east, north, distance, sign)
-                snapped = (center(raw[0]), center(raw[1]))
-                self.assertIn(snapped, sampled)
-                self.assertLessEqual(abs(snapped[0] - raw[0]), cell / 2 + 1e-9)
-                self.assertLessEqual(abs(snapped[1] - raw[1]), cell / 2 + 1e-9)
-                self.assertGreater(abs(snapped[1] + 90), 1e-6)
+        marks = [point_at_mile(route, miles, mile) for mile in sample_miles(miles[-1], 6)]
+        deg = 0.2
+        for lat, lng in sampled:
+            self.assertAlmostEqual(lat, (math.floor(lat / deg + 1e-9) + 0.5) * deg, places=7)
+            self.assertAlmostEqual(lng, (math.floor(lng / deg + 1e-9) + 0.5) * deg, places=7)
+            self.assertTrue(any(haversine_miles((lat, lng), mark) <= 22 + 1e-6 for mark in marks))
+        self.assertTrue(any(lng < -90 for _lat, lng in sampled))
+        self.assertTrue(any(lng > -90 for _lat, lng in sampled))
+
+
+class SimplifyTest(unittest.TestCase):
+    def test_straight_line_keeps_endpoints(self):
+        coords = [(40.0, -90.0 + i * 0.01) for i in range(100)]
+        simplified = simplify(coords)
+        self.assertEqual(len(simplified), 2)
+        self.assertEqual(simplified[0][:2], coords[0])
+        self.assertEqual(simplified[-1][:2], coords[-1])
+
+    def test_l_shape_keeps_the_corner(self):
+        horizontal = [(40.0, -90.0 + i * 0.02) for i in range(11)]
+        vertical = [(40.0 + i * 0.02, horizontal[-1][1]) for i in range(1, 11)]
+        coords = horizontal + vertical
+        simplified = simplify(coords)
+        pairs = [(lat, lng) for lat, lng, _mile in simplified]
+        self.assertEqual(pairs[0], coords[0])
+        self.assertEqual(pairs[-1], coords[-1])
+        self.assertIn(horizontal[-1], pairs)
+        self.assertEqual(len(pairs), 3)
+
+    def test_miles_stay_on_the_original_route(self):
+        coords = [(0.0, 0.0)]
+        for index in range(1, 40):
+            coords.append((index * 0.02, 0.0002 if index % 2 else 0.0))
+        coords.append((0.8, 0.0))
+        simplified = simplify(coords)
+        self.assertEqual(len(simplified), 2)
+        full = cumulative_miles(coords)[-1]
+        self.assertAlmostEqual(simplified[-1][2], full)
+        self.assertGreater(full, haversine_miles(coords[0], coords[-1]))
+
+    def test_simplified_geometry_splits_at_checkpoint_miles(self):
+        coords = [(0.0, index * 0.01) for index in range(80)]
+        total = cumulative_miles(coords)[-1]
+        simplified = simplify(coords)
+        self.assertEqual(len(simplified), 2)
+        self.assertAlmostEqual(simplified[-1][2], total)
+        mile = 25
+        checkpoints = [
+            {"mile": 0, "lat": coords[0][0], "lng": coords[0][1], "level": "Low"},
+            {"mile": mile, "lat": 0.0, "lng": math.degrees(mile / EARTH_MILES), "level": "High"},
+            {"mile": total, "lat": coords[-1][0], "lng": coords[-1][1], "level": "Severe"},
+        ]
+        segments = color_segments(simplified, checkpoints)
+        self.assertEqual(segments[0]["level"], "High")
+        self.assertEqual(segments[-1]["level"], "Severe")
+        flat = [point for segment in segments for point in segment["positions"]]
+        self.assertTrue(any(abs(point[1] - checkpoints[1]["lng"]) < 1e-9 for point in flat))
 
 
 if __name__ == "__main__":

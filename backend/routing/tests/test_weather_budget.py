@@ -98,7 +98,7 @@ class WeatherBudgetTest(unittest.TestCase):
         unique = set(sent)
         self.assertLessEqual(len(unique), 350)
         self.assertTrue(plan["corridor"])
-        self.assertEqual(plan["corridor_cell_deg"], 0.2)
+        self.assertIn(plan["corridor_cell_deg"], (0.25, 0.3))
         self.assertTrue(all(len(point["risks"]) == 49 for point in plan["corridor"]))
         for route in plan["routes"]:
             self.assertTrue(route["checkpoints"])
@@ -110,7 +110,7 @@ class WeatherBudgetTest(unittest.TestCase):
         self.assertGreater(calls, 0)
         again = build_plan(_body(), _long_routes, open_meteo)
         self.assertEqual(get.call_count, calls)
-        self.assertEqual(again["corridor_cell_deg"], 0.2)
+        self.assertIn(again["corridor_cell_deg"], (0.25, 0.3))
         self.assertTrue(again["corridor"])
 
     @patch("routing.services.requests.get")
