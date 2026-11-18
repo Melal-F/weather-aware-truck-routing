@@ -15,7 +15,6 @@ cp .env.example .env
 
 cd backend
 export ORS_API_KEY=your-key
-export NOMINATIM_USER_AGENT="WeatherTruckRouting/1.0 (you@example.com)"
 python manage.py runserver
 ```
 
@@ -44,7 +43,7 @@ docker compose up --build
 
 The site is on http://127.0.0.1:8000. Set `ALLOWED_HOSTS` to the public hostname when you deploy that image.
 
-`ORS_API_KEY` is an OpenRouteService key. `NOMINATIM_USER_AGENT` should identify this app. Open-Meteo and the map tiles do not need keys.
+`ORS_API_KEY` is an OpenRouteService key. Geocoding uses ORS autocomplete with the same `ORS_API_KEY`. Open-Meteo and the map tiles do not need keys.
 
 ## What the driver sends
 
@@ -118,7 +117,6 @@ The repo is a Docker web service. The image builds the React app, then gunicorn 
 3. Instance type can be the free web service. The first request after sleep takes a minute.
 4. Environment variables:
    - `ORS_API_KEY` — free key from OpenRouteService
-   - `NOMINATIM_USER_AGENT` — `WeatherTruckRouting/1.0 (you@example.com)`
    - `DJANGO_SECRET_KEY` — a long random string
    - `DJANGO_DEBUG` — `0`
    - `ALLOWED_HOSTS` — the Render hostname, such as `weather-truck-routing.onrender.com`

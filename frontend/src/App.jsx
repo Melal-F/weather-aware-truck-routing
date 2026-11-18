@@ -22,7 +22,7 @@ function PlaceField({ id, label, query, setQuery, pick, setPick }) {
   const seq = useRef(0);
 
   useEffect(() => {
-    if (pick || query.trim().length < 2) {
+    if (pick || query.trim().length < 3) {
       setHits([]);
       return undefined;
     }

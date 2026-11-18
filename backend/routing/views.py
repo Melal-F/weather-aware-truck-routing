@@ -2,7 +2,7 @@ import requests
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from routing.services import PlanError, build_plan, nominatim_search, open_meteo, ors_routes
+from routing.services import PlanError, build_plan, open_meteo, ors_autocomplete, ors_routes
 
 
 class GeocodeView(APIView):
@@ -11,7 +11,7 @@ class GeocodeView(APIView):
 
     def get(self, request):
         try:
-            results = nominatim_search(request.GET.get("q", ""))
+            results = ors_autocomplete(request.GET.get("q", ""))
         except PlanError as exc:
             return Response({"error": str(exc)}, status=exc.status)
         except requests.RequestException:

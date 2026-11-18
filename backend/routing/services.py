@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import requests
+from django.core.cache import cache
 
 from routing.geo import (
     color_segments,
@@ -368,32 +369,53 @@ def ors_routes(origin, destination, load_lb=None):
     return kept[:3]
 
 
-def nominatim_search(query):
+def ors_autocomplete(query):
     text = (query or "").strip()
-    if len(text) < 2:
+    if len(text) < 3:
         return []
+    cache_key = "geo:" + text.lower()
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    key = os.environ.get("ORS_API_KEY", "").strip()
+    if not key:
+        raise PlanError(
+            "ORS_API_KEY is not set. Add a free OpenRouteService key and restart.",
+            status=500,
+        )
     response = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={"q": text, "format": "jsonv2", "limit": 5},
-        headers={
-            "User-Agent": os.environ.get("NOMINATIM_USER_AGENT", "WeatherTruckRouting/1.0"),
-            "Accept": "application/json",
-        },
-        timeout=15,
+        "https://api.openrouteservice.org/geocode/autocomplete",
+        params={"api_key": key, "text": text},
+        timeout=10,
     )
+    if response.status_code in (401, 403):
+        raise PlanError("OpenRouteService rejected the API key.", status=502)
     if response.status_code == 429:
         raise PlanError("Geocoding is busy. Wait a second and try again.", status=429)
     if response.status_code >= 400:
         raise PlanError("Geocoding is unavailable right now.", status=502)
+    try:
+        payload = response.json()
+    except ValueError:
+        raise PlanError("Geocoding is unavailable right now.", status=502) from None
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, list):
+        features = []
     found = []
-    for item in response.json():
-        found.append(
-            {
-                "name": item.get("display_name") or text,
-                "lat": float(item["lat"]),
-                "lng": float(item["lon"]),
-            }
-        )
+    for feature in features[:5]:
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        label = properties.get("label") if isinstance(properties, dict) else None
+        coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if not isinstance(label, str) or not label:
+            continue
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            continue
+        lng, lat = coords[0], coords[1]
+        if type(lng) not in (int, float) or type(lat) not in (int, float):
+            continue
+        found.append({"name": label, "lat": lat, "lng": lng})
+    cache.set(cache_key, found, 600)
     return found
 
 

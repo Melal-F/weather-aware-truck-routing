@@ -37,7 +37,7 @@ class PlanApiTest(SimpleTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["results"], [])
 
-    @patch("routing.views.nominatim_search", return_value=[{"name": "Chicago", "lat": 41.8, "lng": -87.6}])
+    @patch("routing.views.ors_autocomplete", return_value=[{"name": "Chicago", "lat": 41.8, "lng": -87.6}])
     def test_geocode_returns_results(self, _search):
         response = Client().get("/api/geocode", {"q": "Chicago"})
         self.assertEqual(response.json()["results"][0]["name"], "Chicago")
