@@ -27,8 +27,16 @@ from routing.risk import (
 SPACINGS = (10, 25, 50)
 FORECAST_HOURS = 49
 WEATHER_CHUNK = 100
-LONG_TRIP_KM = 100
+# ORS rejects alternative_routes once the crow-flies trip is longer than this.
+ALTERNATIVES_MAX_KM = 90
+VIA_FRACTIONS = (0.08, 0.15, 0.25)
+VIA_OFFSET_CAP_KM = 120
+DETOUR_LIMIT = 1.6
+# Empty tractor-trailer. ORS weight is the gross vehicle weight, not the cargo.
+TARE_LB = 35000
 LB_TO_TONNES = 0.00045359237
+# ORS stores HGV weight in hundredths of a tonne in a 16-bit field (0–327.67).
+ORS_MAX_WEIGHT_TONNES = 327.67
 KM_PER_MILE = 1.609344
 ORS_URL = "https://api.openrouteservice.org/v2/directions/{profile}/geojson"
 
@@ -189,7 +197,9 @@ def _ors_message(response):
 def weight_tonnes(load_lb):
     if load_lb is None:
         return None
-    return round(float(load_lb) * LB_TO_TONNES, 2)
+    gross_lb = float(load_lb) + TARE_LB
+    tonnes = min(gross_lb * LB_TO_TONNES, ORS_MAX_WEIGHT_TONNES)
+    return round(tonnes, 2)
 
 
 def _trip_km(origin, destination):
@@ -201,7 +211,7 @@ def _trip_km(origin, destination):
 
 
 def via_points(origin, destination):
-    """Four points beside the crow-flies line, so a long haul can leave the highway."""
+    """Points beside the crow-flies line, nearest offset first, both sides."""
     mid_lat = (origin["lat"] + destination["lat"]) / 2
     mid_lng = (origin["lng"] + destination["lng"]) / 2
     north_km = (destination["lat"] - origin["lat"]) * 110.574
@@ -210,8 +220,8 @@ def via_points(origin, destination):
     side_east = -north_km / length
     side_north = east_km / length
     points = []
-    for fraction in (0.25, 0.45):
-        offset = length * fraction
+    for fraction in VIA_FRACTIONS:
+        offset = min(length * fraction, VIA_OFFSET_CAP_KM)
         for sign in (1, -1):
             east = side_east * offset * sign
             north = side_north * offset * sign
@@ -241,7 +251,8 @@ def _keep_distinct(kept, candidate):
 
 
 def _ors_body(coordinates, load_lb, alternatives):
-    body = {"coordinates": coordinates}
+    # -1 lets ORS snap a point that is not on a road to the nearest road.
+    body = {"coordinates": coordinates, "radiuses": [-1] * len(coordinates)}
     if alternatives:
         body["alternative_routes"] = {
             "target_count": 3,
@@ -279,6 +290,29 @@ def _ors_call(profile, coordinates, load_lb, key, alternatives):
     return routes_from_geojson(response.json()), "ok"
 
 
+def _prune_vias(kept):
+    if not kept:
+        return
+    limit = DETOUR_LIMIT * min(route["duration_seconds"] for route in kept)
+    kept[:] = [
+        route
+        for route in kept
+        if not route.get("via") or route["duration_seconds"] <= limit
+    ]
+
+
+def _direct_routes(profile, coordinates, load_lb, key, alternatives):
+    """One direct request. A 400 that only happens with alternative_routes is retried without it."""
+    routes, status = _ors_call(profile, coordinates, load_lb, key, alternatives)
+    if status == "unauthorized":
+        raise PlanError("OpenRouteService rejected the API key.", status=502)
+    if alternatives and status == "refused":
+        routes, status = _ors_call(profile, coordinates, load_lb, key, False)
+        if status == "unauthorized":
+            raise PlanError("OpenRouteService rejected the API key.", status=502)
+    return routes, status
+
+
 def ors_routes(origin, destination, load_lb=None):
     key = os.environ.get("ORS_API_KEY", "").strip()
     if not key:
@@ -286,25 +320,24 @@ def ors_routes(origin, destination, load_lb=None):
             "ORS_API_KEY is not set. Add a free OpenRouteService key and restart.",
             status=500,
         )
+    trip_km = _trip_km(origin, destination)
+    long_trip = trip_km > ALTERNATIVES_MAX_KM
     direct = [
         [origin["lng"], origin["lat"]],
         [destination["lng"], destination["lat"]],
     ]
     profile = "driving-hgv"
-    routes, status = _ors_call(profile, direct, load_lb, key, alternatives=True)
-    if status == "unauthorized":
-        raise PlanError("OpenRouteService rejected the API key.", status=502)
-    if status == "refused" or not routes:
+    routes, status = _direct_routes(profile, direct, load_lb, key, alternatives=not long_trip)
+    # Car only when HGV itself was refused on a body that did not ask for alternatives.
+    if status == "refused" or (not routes and not long_trip):
         profile = "driving-car"
-        routes, status = _ors_call(profile, direct, None, key, alternatives=True)
-        if status == "unauthorized":
-            raise PlanError("OpenRouteService rejected the API key.", status=502)
-        if status == "refused":
+        routes, status = _direct_routes(profile, direct, None, key, alternatives=not long_trip)
+        if status == "refused" or (not routes and not long_trip):
             raise PlanError("The routing service rejected the request.", status=502)
     kept = []
-    for route in routes:
+    for route in routes or []:
         _keep_distinct(kept, route)
-    if _trip_km(origin, destination) > LONG_TRIP_KM and len(kept) < 3:
+    if long_trip and len(kept) < 3:
         for via in via_points(origin, destination):
             if len(kept) >= 3:
                 break
@@ -314,14 +347,24 @@ def ors_routes(origin, destination, load_lb=None):
                 [destination["lng"], destination["lat"]],
             ]
             try:
-                extra, extra_status = _ors_call(profile, path, load_lb, key, alternatives=False)
+                extra, extra_status = _ors_call(profile, path, load_lb, key, False)
             except PlanError:
                 continue
             if extra_status != "ok" or not extra:
                 continue
-            _keep_distinct(kept, extra[0])
+            candidate = extra[0]
+            if kept and candidate["duration_seconds"] > DETOUR_LIMIT * min(
+                route["duration_seconds"] for route in kept
+            ):
+                continue
+            candidate["via"] = True
+            if _keep_distinct(kept, candidate):
+                _prune_vias(kept)
     if not kept:
         raise PlanError("No driving route was found between those places.", status=502)
+    for route in kept:
+        route.pop("via", None)
+        route["profile"] = profile
     return kept[:3]
 
 
@@ -447,6 +490,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
                 "duration_seconds": duration,
                 "distance_miles": cumulative_miles(coords)[-1],
                 "checkpoints": checkpoints,
+                "profile": raw.get("profile"),
             }
         )
     if not drafts:
@@ -514,6 +558,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
                 "segments": color_segments(draft["coords"], checkpoints),
                 "miles": miles,
                 "average_risk": average_risk(miles),
+                "profile": draft.get("profile"),
             }
         )
     rank_routes(routes)
@@ -557,6 +602,7 @@ def _public_route(route):
         "duration_seconds": round(route["duration_seconds"]),
         "arrival": route["arrival"].isoformat(),
         "average_risk": _round(route["average_risk"], 3),
+        "profile": route.get("profile"),
         "miles": {name: round(amount, 2) for name, amount in route["miles"].items()},
         "checkpoints": [
             {

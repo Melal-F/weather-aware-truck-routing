@@ -63,6 +63,27 @@ class PlaceCheckpointsTest(unittest.TestCase):
         sampled = corridor_samples([coords, coords], spacing_miles=10, cap=30)
         self.assertEqual(len(sampled), 30)
 
+    def test_north_south_route_offsets_side_points(self):
+        sampled = corridor_samples([[(40.0, -90.0), (41.0, -90.0)]], spacing_miles=30)
+        centers = [point for point in sampled if abs(point[1] + 90) < 1e-6]
+        self.assertGreaterEqual(len(centers), 2)
+        middle = min(centers, key=lambda point: abs(point[0] - 40.5))
+        sides = [
+            point
+            for point in sampled
+            if abs(point[0] - middle[0]) < 0.02 and abs(point[1] + 90) > 1e-4
+        ]
+        self.assertEqual(len(sides), 4)
+        for point in sides:
+            self.assertAlmostEqual(point[0], middle[0], delta=0.01)
+        distances = sorted(haversine_miles(middle, point) for point in sides)
+        self.assertAlmostEqual(distances[0], 10, delta=0.8)
+        self.assertAlmostEqual(distances[1], 10, delta=0.8)
+        self.assertAlmostEqual(distances[2], 20, delta=0.8)
+        self.assertAlmostEqual(distances[3], 20, delta=0.8)
+        self.assertTrue(any(point[1] < -90 for point in sides))
+        self.assertTrue(any(point[1] > -90 for point in sides))
+
 
 if __name__ == "__main__":
     unittest.main()

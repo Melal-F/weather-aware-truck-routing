@@ -12,6 +12,7 @@ from routing.risk import (
     miles_by_level,
     mm_to_inches,
     rank_routes,
+    recommendation_reason,
 )
 
 
@@ -170,6 +171,22 @@ class RankRoutesTest(unittest.TestCase):
         routes = [blank, scored]
         rank_routes(routes)
         self.assertTrue(scored["recommended"])
+
+    def test_reason_quotes_the_runner_up(self):
+        severe = route(0, 12.4, 0, 3, 7 * 3600)
+        winner = route(0, 0, 1, 1.5, 6 * 3600 + 10 * 60)
+        routes = [severe, winner]
+        rank_routes(routes)
+        self.assertEqual(recommendation_reason(routes), "Fewest Severe miles: 0.0 vs 12.4 mi")
+
+        longer = route(0, 0, 0, 1, 6 * 3600 + 45 * 60, low=10)
+        shorter = route(0, 0, 0, 1, 6 * 3600 + 10 * 60, low=10)
+        tied_miles = [longer, shorter]
+        rank_routes(tied_miles)
+        self.assertEqual(
+            recommendation_reason(tied_miles),
+            "Shortest travel time: 6 h 10 min vs 6 h 45 min",
+        )
 
 
 class UnitConversionTest(unittest.TestCase):

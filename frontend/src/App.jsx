@@ -87,6 +87,9 @@ function RouteCard({ route, selected, onSelect }) {
         <strong>Route {route.id + 1}</strong>
         {route.recommended && <span className="badge">Recommended</span>}
       </header>
+      {route.profile === "driving-car" && (
+        <p className="muted">Car profile (truck routing unavailable)</p>
+      )}
       {route.recommended && route.recommendation_reason && (
         <p className="reason">{route.recommendation_reason}</p>
       )}

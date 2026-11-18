@@ -181,19 +181,70 @@ def color_segments(coords, checkpoints):
     return segments
 
 
-def corridor_samples(routes, spacing_miles, cap=200):
-    """Points along every route. Thinned to `cap` so a long haul stays one weather call."""
-    sampled = []
+MILES_PER_DEG_LAT = EARTH_MILES * math.pi / 180.0
+CORRIDOR_SIDE_MILES = (10, 20)
+
+
+def _thin(points, cap):
+    if cap <= 0 or not points:
+        return []
+    if len(points) <= cap:
+        return points
+    if cap == 1:
+        return [points[0]]
+    step = (len(points) - 1) / (cap - 1)
+    return [points[round(index * step)] for index in range(cap)]
+
+
+def _segment_heading(coords, miles, target):
+    if target <= 0:
+        start, end = coords[0], coords[1]
+    elif target >= miles[-1]:
+        start, end = coords[-2], coords[-1]
+    else:
+        start, end = coords[0], coords[1]
+        for index in range(1, len(miles)):
+            if miles[index] >= target:
+                start, end = coords[index - 1], coords[index]
+                break
+    mid_lat = (start[0] + end[0]) / 2
+    north = (end[0] - start[0]) * MILES_PER_DEG_LAT
+    east = (end[1] - start[1]) * MILES_PER_DEG_LAT * math.cos(math.radians(mid_lat))
+    return east, north
+
+
+def _side_point(lat, lng, east, north, distance, sign):
+    length = math.hypot(east, north) or 1.0
+    offset_east = -north / length * distance * sign
+    offset_north = east / length * distance * sign
+    cosine = math.cos(math.radians(lat)) or 1.0
+    return (
+        lat + offset_north / MILES_PER_DEG_LAT,
+        lng + offset_east / (MILES_PER_DEG_LAT * cosine),
+    )
+
+
+def corridor_samples(routes, spacing_miles, cap=600):
+    """Route samples plus points 10 and 20 miles to each side.
+
+    When the list is longer than `cap`, route-line points are thinned first.
+    """
+    center = []
+    sides = []
     for coords in routes:
         if len(coords) < 2:
             continue
         miles = cumulative_miles(coords)
         for mile in sample_miles(miles[-1], spacing_miles):
             lat, lng = point_at_mile(coords, miles, mile)
-            sampled.append((lat, lng))
-    if len(sampled) <= cap:
-        return sampled
-    if cap <= 1:
-        return sampled[:1]
-    step = (len(sampled) - 1) / (cap - 1)
-    return [sampled[round(index * step)] for index in range(cap)]
+            center.append((lat, lng))
+            east, north = _segment_heading(coords, miles, mile)
+            for distance in CORRIDOR_SIDE_MILES:
+                for sign in (1, -1):
+                    sides.append(_side_point(lat, lng, east, north, distance, sign))
+    if len(center) + len(sides) <= cap:
+        return center + sides
+    room = cap - len(sides)
+    if room <= 0:
+        return _thin(sides, cap)
+    return _thin(center, room) + sides

@@ -3,8 +3,18 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from routing.geo import cumulative_miles, place_checkpoints
-from routing.services import LB_TO_TONNES, build_plan, open_meteo, ors_routes
+from routing.geo import cumulative_miles, haversine_miles, place_checkpoints
+from routing.services import (
+    KM_PER_MILE,
+    TARE_LB,
+    LB_TO_TONNES,
+    ORS_MAX_WEIGHT_TONNES,
+    build_plan,
+    open_meteo,
+    ors_routes,
+    via_points,
+    weight_tonnes,
+)
 
 
 def _response(status, payload):
@@ -40,29 +50,35 @@ class ViaFallbackTest(unittest.TestCase):
     @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
     @patch("routing.services.requests.post")
     def test_long_trip_adds_via_routes_until_three(self, post):
-        # About 144 km south, so the direct alternative is not enough on its own.
+        # About 144 km south. Real ORS returns 400 when this distance asks for alternatives.
         origin = {"name": "North", "lat": 41.88, "lng": -87.63}
         destination = {"name": "South", "lat": 40.58, "lng": -87.63}
         direct = [[-87.63, 41.88], [-87.63, 41.2], [-87.63, 40.58]]
 
         def post_json(url, json=None, headers=None, timeout=None):
-            shift = 0.0 if len(post.call_args_list) == 1 else 0.5 * len(post.call_args_list)
-            line = [[lng - shift, lat] for lng, lat in direct]
-            return _response(200, {"features": [_feature(line, 5000 + shift)]})
+            body = json or {}
+            if "alternative_routes" in body:
+                return _response(400, {"error": {"message": "Request parameters exceed the server configuration."}})
+            shift = 0.35 * post.call_count
+            line = [[lng + shift, lat] for lng, lat in direct]
+            return _response(200, {"features": [_feature(line, 4000 + shift * 100)]})
 
         post.side_effect = post_json
         routes = ors_routes(origin, destination, load_lb=42000)
         self.assertEqual(len(routes), 3)
+        self.assertTrue(all(route["profile"] == "driving-hgv" for route in routes))
         bodies = [call.kwargs["json"] for call in post.call_args_list]
+        self.assertTrue(bodies)
+        self.assertTrue(all("alternative_routes" not in body for body in bodies))
+        self.assertTrue(all("/driving-hgv/" in call.args[0] for call in post.call_args_list))
         self.assertEqual(len(bodies[0]["coordinates"]), 2)
-        self.assertIn("alternative_routes", bodies[0])
-        self.assertEqual(
-            bodies[0]["options"]["profile_params"]["restrictions"]["weight"],
-            round(42000 * LB_TO_TONNES, 2),
-        )
-        via_bodies = [body for body in bodies[1:] if len(body["coordinates"]) == 3]
+        self.assertEqual(bodies[0]["radiuses"], [-1, -1])
+        self.assertEqual(bodies[0]["options"]["profile_params"]["restrictions"]["weight"], weight_tonnes(42000))
+        self.assertEqual(weight_tonnes(42000), round((42000 + TARE_LB) * LB_TO_TONNES, 2))
+        self.assertEqual(weight_tonnes(10**9), ORS_MAX_WEIGHT_TONNES)
+        via_bodies = [body for body in bodies if len(body["coordinates"]) == 3]
         self.assertGreaterEqual(len(via_bodies), 2)
-        self.assertNotIn("alternative_routes", via_bodies[0])
+        self.assertEqual(via_bodies[0]["radiuses"], [-1, -1, -1])
         self.assertEqual(len({round(route["coords"][1][1], 2) for route in routes}), 3)
 
 
@@ -152,8 +168,46 @@ class RecommendationReasonTest(unittest.TestCase):
         )
         winner = next(route for route in plan["routes"] if route["recommended"])
         self.assertEqual(winner["id"], 1)
-        self.assertEqual(winner["recommendation_reason"], "Recommended for the fewest miles that are No Travel.")
+        self.assertRegex(
+            winner["recommendation_reason"],
+            r"^Fewest No Travel miles: 0\.0 vs [0-9]+\.[0-9] mi$",
+        )
+        shown = float(winner["recommendation_reason"].split(" vs ")[1].split(" ")[0])
+        self.assertAlmostEqual(shown, plan["routes"][0]["miles"]["No Travel"], delta=0.05)
         self.assertIsNone(plan["routes"][0]["recommendation_reason"])
+
+
+class ViaOffsetTest(unittest.TestCase):
+    def _km_from_midpoint(self, origin, destination):
+        points = via_points(origin, destination)
+        mid = (
+            (origin["lat"] + destination["lat"]) / 2,
+            (origin["lng"] + destination["lng"]) / 2,
+        )
+        return points, [
+            haversine_miles(mid, (point["lat"], point["lng"])) * KM_PER_MILE for point in points
+        ]
+
+    def test_offsets_follow_percentages_and_the_cap(self):
+        origin = {"lat": 40.0, "lng": -90.0}
+        near = {"lat": 40.0 + (200 / 110.574), "lng": -90.0}
+        points, distances = self._km_from_midpoint(origin, near)
+        self.assertEqual(len(points), 6)
+        for index, fraction in enumerate((0.08, 0.15, 0.25)):
+            expected = 200 * fraction
+            self.assertAlmostEqual(distances[index * 2], expected, delta=1.5)
+            self.assertAlmostEqual(distances[index * 2 + 1], expected, delta=1.5)
+        self.assertLess(points[0]["lng"], origin["lng"])
+        self.assertGreater(points[1]["lng"], origin["lng"])
+
+        far = {"lat": 40.0 + (800 / 110.574), "lng": -90.0}
+        _capped, capped_km = self._km_from_midpoint(origin, far)
+        self.assertAlmostEqual(capped_km[0], 64, delta=2)
+        self.assertAlmostEqual(capped_km[1], 64, delta=2)
+        self.assertAlmostEqual(capped_km[2], 120, delta=2)
+        self.assertAlmostEqual(capped_km[3], 120, delta=2)
+        self.assertAlmostEqual(capped_km[4], 120, delta=2)
+        self.assertAlmostEqual(capped_km[5], 120, delta=2)
 
 
 if __name__ == "__main__":

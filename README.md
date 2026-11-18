@@ -1,5 +1,7 @@
 # Weather-Aware Truck Routing
 
+Live demo: https://YOUR-APP.onrender.com
+
 A React and Django desk for a truck driver. Enter an origin, a destination, a departure time, and a load weight. The app asks OpenRouteService for up to three driving routes, samples weather along each one, and recommends the safest option.
 
 ## Run it locally
@@ -50,9 +52,9 @@ Origin and destination (a picked place, with a name and coordinates), departure 
 
 ## Routes
 
-The first call asks OpenRouteService for three alternatives on the `driving-hgv` profile. The truck’s load is sent as a weight restriction in metric tonnes (`pounds × 0.00045359237`). If that profile is refused, the same call is made with `driving-car` and no weight restriction.
+The crow-flies distance is computed first. Up to 90 km, the app asks OpenRouteService for three alternatives on `driving-hgv`. Longer trips never send `alternative_routes`, because that request is rejected. They take the direct truck route, then fill up to three with routes through points 8%, 15%, and 25% of the straight-line length off to either side, nearest first. An offset is capped at 120 km. Every request sends `radiuses` of `-1` so a point that is not on a road snaps to the nearest one. A via route whose driving time is more than 1.6 times the fastest route already kept is dropped. A line is kept only when it stays more than about 5 miles from the ones already kept. The app still does not invent a line the service did not return. When fewer than three survive, the note on the page says so.
 
-On a trip longer than 100 km, three alternatives are not guaranteed. When fewer than three distinct lines come back, the app asks again through points set off to either side of the straight line between the cities, and keeps a route only when it stays more than about 5 miles away from the ones already kept. It still does not invent a line the service did not return. When fewer than three survive, the note on the page says so.
+The HGV call sends gross weight in metric tonnes: the load plus `TARE_LB` (35,000 lb, an empty tractor-trailer) in `backend/routing/services.py`, times `0.00045359237`, capped at 327.67 t. That cap is the largest weight OpenRouteService stores (hundredths of a tonne in a 16-bit field). The app switches to `driving-car`, with no weight, only when `driving-hgv` itself is refused on a request that did not ask for alternatives. A 400 from an alternatives request is not treated as the truck profile being unavailable. Each route reports `profile`. A car route shows “Car profile (truck routing unavailable)” on its card.
 
 Checkpoints sit on the driven path, not on a straight line between cities. The origin and the destination are always included. The last gap is shorter when the length is not a multiple of the spacing.
 
@@ -93,7 +95,7 @@ Best first:
 
 No Travel is sorted first so an impassable route cannot beat a route that is only severe. The brief’s four keys follow that, in the same order.
 
-The recommended card states the first of those keys that actually separated the winner, for example “Recommended for the fewest Severe miles.” A full tie keeps the first route the service returned.
+The recommended card states the first of those keys that actually separated the winner, with the winner’s number against the runner-up, for example “Fewest Severe miles: 0.0 vs 12.4 mi” or “Shortest travel time: 6 h 10 min vs 6 h 45 min.” A full tie keeps the first route the service returned.
 
 ## Units
 
@@ -101,15 +103,15 @@ The page and the API stay in miles, mph, inches per hour, and pounds. Open-Meteo
 
 ## The map and the slider
 
-All routes are drawn at once, split into runs of one risk color. Each route keeps a summary label on the map (distance, travel time, average risk). Checkpoints are dots. Hovering a checkpoint shows the mile, the ETA, the combined risk, and the wind, rain, and snow readings. A click opens the same detail and selects that route. The panel lists distance, travel time, arrival, miles in each level, average risk, and a Recommended badge with the reason under it.
+All routes are drawn at once, split into runs of one risk color. Each route keeps a summary label on the map (distance, travel time, Severe and High miles, average risk). Checkpoints are dots. Hovering a checkpoint shows the mile, the ETA, the combined risk, and the wind, rain, and snow readings. A click opens the same detail and selects that route. The panel lists distance, travel time, arrival, miles in each level, average risk, and a Recommended badge with the reason under it.
 
-The corridor is a band of radial gradients along the routes, about 16 km across, drawn wider in pixels as you zoom in. All 49 hours are cached for the current view, so dragging the slider or pressing Play only swaps a frame. Hide corridor turns the band off. None of that calls the network again, and checkpoint risk stays tied to arrival time. Hour 0 is the departure hour. Hour 48 is 48 hours later.
+The corridor is a band, not a single line. For each sample along a route the forecast also covers points 10 and 20 miles to either side, perpendicular to the local heading. The list is capped at 600 points. Route-line points are thinned first, and Open-Meteo is still requested in batches of 100. On the map the band is radial gradients about 16 km across, wider in pixels as you zoom in, drawn from lower risk to higher so the worst level sits on top. Dragging the map only moves the existing canvas. The current hour is redrawn once the pan or zoom settles, or when the slider or Play changes the hour. Up to six hours already drawn for that view are kept and dropped when the view changes. Hide corridor turns the band off. None of that calls the network again, and checkpoint risk stays tied to arrival time. Hour 0 is the departure hour. Hour 48 is 48 hours later.
 
 Colors: Low green, Moderate yellow, High orange, Severe red, No Travel black.
 
-## Deploy on Render
+## Hosting
 
-The repo is a Docker web service. Render builds the root `Dockerfile` and runs gunicorn on port 8000.
+The repo is a Docker web service. The image builds the React app, then gunicorn serves that build and the Django API on port 8000. Routing, the via-point fallback, and the corridor forecast all run inside that process. The only extra configuration is the environment below. Render builds the root `Dockerfile`.
 
 1. In Render, create a Web Service and connect `https://github.com/Melal-F/weather-aware-truck-routing`.
 2. Language: Docker. Branch: `main`. Dockerfile path: `Dockerfile`.

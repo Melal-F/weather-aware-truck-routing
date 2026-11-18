@@ -113,8 +113,20 @@ def average_risk(miles):
     return sum(RANK[name] * miles[name] for name in LEVELS) / total
 
 
+def format_duration(seconds):
+    whole = max(0, int(float(seconds) + 0.5))
+    hours = whole // 3600
+    minutes = int((whole % 3600) / 60 + 0.5)
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    if hours <= 0:
+        return f"{minutes} min"
+    return f"{hours} h {minutes} min"
+
+
 def recommendation_reason(routes):
-    """Why the recommended route won, using the first sort key that separates it."""
+    """Why the recommended route won, with its number against the runner-up."""
     winner = next((route for route in routes if route.get("recommended")), None)
     if winner is None:
         return None
@@ -126,26 +138,25 @@ def recommendation_reason(routes):
         value = route.get("average_risk")
         return UNSCORED_AVERAGE if value is None else value
 
+    def miles(best, other):
+        return f"{best:.1f} vs {other:.1f} mi"
+
     checks = (
+        (lambda route: route["miles"]["No Travel"], "Fewest No Travel miles", miles),
+        (lambda route: route["miles"]["Severe"], "Fewest Severe miles", miles),
+        (lambda route: route["miles"]["High"], "Fewest High miles", miles),
+        (average, "Lowest average risk", lambda best, other: f"{best:.2f} vs {other:.2f}"),
         (
-            lambda route: route["miles"]["No Travel"],
-            "fewest miles that are No Travel",
+            lambda route: route["duration_seconds"],
+            "Shortest travel time",
+            lambda best, other: f"{format_duration(best)} vs {format_duration(other)}",
         ),
-        (
-            lambda route: route["miles"]["Severe"],
-            "fewest Severe miles",
-        ),
-        (
-            lambda route: route["miles"]["High"],
-            "fewest High miles",
-        ),
-        (average, "lowest average risk"),
-        (lambda route: route["duration_seconds"], "shortest travel time"),
     )
-    for measure, phrase in checks:
+    for measure, label, render in checks:
         best = measure(winner)
-        if best < min(measure(route) for route in others) - 1e-9:
-            return f"Recommended for the {phrase}."
+        other = min(measure(route) for route in others)
+        if best < other - 1e-9:
+            return f"{label}: {render(best, other)}"
     return "Tied on risk and time; kept the first route the routing service returned."
 
 
