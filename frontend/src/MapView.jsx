@@ -19,10 +19,9 @@ const HeatLayer = L.Layer.extend({
     this._cellDeg = cell > 0 ? cell : 0.2;
     this._hour = 0;
     this._enabled = true;
-    this._sprites = {};
     this._hourCache = new Map();
     this._cacheView = "";
-    this._cacheRadius = null;
+    this._cacheCellPx = null;
     this._origin = null;
   },
 
@@ -74,38 +73,21 @@ const HeatLayer = L.Layer.extend({
     return `${map.getZoom().toFixed(2)}:${center.lat.toFixed(3)}:${center.lng.toFixed(3)}:${size.x}x${size.y}`;
   },
 
-  _cellRadius() {
+  _cellPx() {
     const map = this._map;
     const center = map.getCenter();
     const left = map.latLngToContainerPoint([center.lat, center.lng]);
     const right = map.latLngToContainerPoint([center.lat, center.lng + this._cellDeg]);
-    const width = Math.hypot(right.x - left.x, right.y - left.y);
-    return Math.max(10, Math.min(160, 0.75 * width));
-  },
-
-  _sprite(color, alpha) {
-    const key = `${color}:${alpha}`;
-    const cached = this._sprites[key];
-    if (cached) return cached;
-    const sprite = document.createElement("canvas");
-    sprite.width = 64;
-    sprite.height = 64;
-    const ctx = sprite.getContext("2d");
-    const paint = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    paint.addColorStop(0, rgba(color, alpha));
-    paint.addColorStop(0.55, rgba(color, alpha * 0.5));
-    paint.addColorStop(1, rgba(color, 0));
-    ctx.fillStyle = paint;
-    ctx.fillRect(0, 0, 64, 64);
-    this._sprites[key] = sprite;
-    return sprite;
+    return Math.hypot(right.x - left.x, right.y - left.y);
   },
 
   // Drawn low to high so the worst risk sits on top.
-  // 600-point frame: 1.4 ms median, 4.9 ms max (headless Chrome, 1280×720).
-  _drawHour(ctx, ratio, hour, radius) {
+  // Each item is the center of a cell; the rect is cellDeg wide and tall.
+  _drawHour(ctx, ratio, hour) {
     const map = this._map;
     const size = map.getSize();
+    const cell = this._cellDeg;
+    const half = cell / 2;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, size.x, size.y);
     const order = this._points
@@ -114,11 +96,15 @@ const HeatLayer = L.Layer.extend({
     for (const item of order) {
       const point = item.point;
       const level = point.risks[hour];
-      const at = map.latLngToContainerPoint([point.lat, point.lng]);
-      if (at.x < -radius || at.y < -radius || at.x > size.x + radius || at.y > size.y + radius) continue;
-      const alpha = level ? 0.55 : 0.2;
-      const sprite = this._sprite(RISK_COLORS[level] || "#8a8a8a", alpha);
-      ctx.drawImage(sprite, at.x - radius, at.y - radius, radius * 2, radius * 2);
+      const nw = map.latLngToContainerPoint([point.lat + half, point.lng - half]);
+      const se = map.latLngToContainerPoint([point.lat - half, point.lng + half]);
+      const x = Math.min(nw.x, se.x);
+      const y = Math.min(nw.y, se.y);
+      const w = Math.abs(se.x - nw.x);
+      const h = Math.abs(se.y - nw.y);
+      if (w <= 0 || h <= 0 || x > size.x || y > size.y || x + w < 0 || y + h < 0) continue;
+      ctx.fillStyle = rgba(RISK_COLORS[level] || "#8a8a8a", 0.45);
+      ctx.fillRect(x, y, w, h);
     }
   },
 
@@ -144,25 +130,26 @@ const HeatLayer = L.Layer.extend({
     canvas.height = Math.max(1, size.y) * ratio;
     canvas.style.width = `${size.x}px`;
     canvas.style.height = `${size.y}px`;
+    const cellPx = this._cellPx();
+    canvas.style.filter = `blur(${Math.round(cellPx * 0.35)}px)`;
     this._origin = map.containerPointToLayerPoint([0, 0]);
     L.DomUtil.setPosition(canvas, this._origin);
     const ctx = canvas.getContext("2d");
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!this._enabled) return;
-    const radius = this._cellRadius();
     const view = this._viewKey();
-    if (view !== this._cacheView || radius !== this._cacheRadius) {
+    if (view !== this._cacheView || cellPx !== this._cacheCellPx) {
       this._hourCache.clear();
       this._cacheView = view;
-      this._cacheRadius = radius;
+      this._cacheCellPx = cellPx;
     }
     const frame = this._hourCache.get(this._hour);
     if (frame && frame.width === canvas.width && frame.height === canvas.height) {
       ctx.drawImage(frame, 0, 0);
       return;
     }
-    this._drawHour(ctx, ratio, this._hour, radius);
+    this._drawHour(ctx, ratio, this._hour);
     this._remember(this._hour, canvas);
   },
 });
@@ -175,13 +162,47 @@ function summaryHtml(route) {
   return `<div class="route-tip"><strong>Route ${route.id + 1}${badge}</strong><div>${Number(route.distance_miles).toFixed(0)} mi · ${formatDuration(route.duration_seconds)}</div><div>Severe ${severe} mi · High ${high} mi</div><div>Average risk ${risk}</div></div>`;
 }
 
-function routeMidpoint(route) {
-  const positions = route.segments.flatMap((segment) => segment.positions);
+const LABEL_DIRECTION = ["right", "left", "top"];
+
+function routePositions(route) {
+  return route.segments.flatMap((segment) => segment.positions);
+}
+
+function samplePosition(positions, fraction) {
+  const index = Math.round(fraction * (positions.length - 1));
+  return positions[Math.min(positions.length - 1, Math.max(0, index))];
+}
+
+// Samples 20%–80% every 5%. Picks the point farthest from every other route.
+function labelPoint(route, others, map) {
+  const positions = routePositions(route);
   if (!positions.length) {
     const point = route.checkpoints[0];
     return point ? [point.lat, point.lng] : null;
   }
-  return positions[Math.floor(positions.length / 2)];
+  const otherPx = [];
+  for (const other of others) {
+    for (const position of routePositions(other)) {
+      otherPx.push(map.latLngToContainerPoint(position));
+    }
+  }
+  if (!otherPx.length) return samplePosition(positions, 0.5);
+  let best = null;
+  let bestDist = -1;
+  for (let step = 4; step <= 16; step += 1) {
+    const sample = samplePosition(positions, step / 20);
+    const at = map.latLngToContainerPoint(sample);
+    let nearest = Infinity;
+    for (const pt of otherPx) {
+      const dist = (at.x - pt.x) ** 2 + (at.y - pt.y) ** 2;
+      if (dist < nearest) nearest = dist;
+    }
+    if (nearest > bestDist) {
+      bestDist = nearest;
+      best = sample;
+    }
+  }
+  return best;
 }
 
 function popupHtml(point) {
@@ -201,12 +222,13 @@ function popupHtml(point) {
   `;
 }
 
-export default function MapView({ plan, selected, hour, onSelect, showHeat = true }) {
+export default function MapView({ plan, selected, hour, onSelect, showHeat = true, sliderRef }) {
   const node = useRef(null);
   const mapRef = useRef(null);
   const heatRef = useRef(null);
   const linesRef = useRef([]);
   const marksRef = useRef([]);
+  const labelsRef = useRef([]);
   const hourRef = useRef(hour);
   const showRef = useRef(showHeat);
   const onSelectRef = useRef(onSelect);
@@ -246,6 +268,7 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
     const marks = L.layerGroup().addTo(map);
     linesRef.current = [];
     marksRef.current = [];
+    labelsRef.current = [];
     if (!plan) {
       return () => {
         lines.remove();
@@ -254,7 +277,9 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
     }
 
     const bounds = [];
-    plan.routes.forEach((route) => {
+    const labels = [];
+    plan.routes.forEach((route, index) => {
+      const others = plan.routes.filter((_, otherIndex) => otherIndex !== index);
       const lineGroup = L.featureGroup();
       route.segments.forEach((segment) => {
         const line = L.polyline(segment.positions, {
@@ -269,7 +294,7 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
         lineGroup.addLayer(line);
         segment.positions.forEach((position) => bounds.push(position));
       });
-      const mid = routeMidpoint(route);
+      const mid = labelPoint(route, others, map);
       if (mid) {
         const label = L.circleMarker(mid, {
           pane: "checks",
@@ -278,15 +303,17 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
           fillOpacity: 0,
           interactive: false,
           summary: true,
+          routeId: route.id,
         });
         label.bindTooltip(summaryHtml(route), {
           permanent: true,
-          direction: "top",
+          direction: LABEL_DIRECTION[index % 3],
           offset: [0, -6],
           className: "route-label",
           opacity: 1,
         });
         lineGroup.addLayer(label);
+        labels[index] = label;
       }
       lineGroup.addTo(lines);
       linesRef.current.push({ id: route.id, group: lineGroup });
@@ -315,6 +342,27 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
       marksRef.current.push({ id: route.id, group: markGroup });
     });
 
+    labelsRef.current = labels;
+
+    const onZoom = () => {
+      plan.routes.forEach((route, index) => {
+        const label = labels[index];
+        if (!label) return;
+        const at = labelPoint(
+          route,
+          plan.routes.filter((_, otherIndex) => otherIndex !== index),
+          map,
+        );
+        if (!at) return;
+        label.setLatLng(at);
+        const tip = label.getTooltip();
+        if (!tip) return;
+        tip.options.direction = LABEL_DIRECTION[index % 3];
+        if (tip._map) tip.update();
+      });
+    };
+    map.on("zoomend", onZoom);
+
     const heat = new HeatLayer(plan.corridor, plan.corridor_cell_deg);
     heat.setEnabled(showRef.current);
     heat.setHour(hourRef.current);
@@ -322,15 +370,22 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
     heatRef.current = heat;
 
     if (bounds.length) {
-      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 12 });
+      const sliderHeight = sliderRef?.current?.offsetHeight || 140;
+      map.fitBounds(bounds, {
+        paddingTopLeft: [40, 40],
+        paddingBottomRight: [40, sliderHeight + 24],
+        maxZoom: 12,
+      });
     }
     return () => {
+      map.off("zoomend", onZoom);
       heat.remove();
       heatRef.current = null;
       lines.remove();
       marks.remove();
       linesRef.current = [];
       marksRef.current = [];
+      labelsRef.current = [];
     };
   }, [plan]);
 
@@ -357,6 +412,14 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
     };
     linesRef.current.forEach((entry) => paint(entry, entry.id === selected));
     marksRef.current.forEach((entry) => paint(entry, entry.id === selected));
+    labelsRef.current.forEach((label) => {
+      const tip = label.getTooltip();
+      if (!tip) return;
+      const on = label.options.routeId === selected;
+      const el = tip.getElement();
+      if (el) el.classList.toggle("selected", on);
+      if (on) tip.bringToFront();
+    });
   }, [plan, selected]);
 
   return <div ref={node} className="map" />;

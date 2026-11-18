@@ -295,6 +295,7 @@ input:focus, select:focus {
 }
 .leaflet-popup-content { margin: 10px 14px; color: #1c1915; font-size: 13px; line-height: 1.4; }
 .leaflet-tooltip.route-label { font-weight: 650; pointer-events: none; }
+.leaflet-tooltip.route-label.selected { z-index: 700; }
 .popup strong, .route-tip strong { display: block; }
 .popup-level { font-weight: 700; margin: 2px 0 4px; }
 

@@ -167,6 +167,7 @@ export default function App() {
   const [showHeat, setShowHeat] = useState(true);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const sliderRef = useRef(null);
 
   useEffect(() => {
     if (!playing || !plan) return undefined;
@@ -319,9 +320,17 @@ export default function App() {
           </div>
         </aside>
         <div className="stage">
-          <MapView plan={plan} selected={selected} hour={hour} onSelect={setSelected} showHeat={showHeat} />
+          <MapView
+            plan={plan}
+            selected={selected}
+            hour={hour}
+            onSelect={setSelected}
+            showHeat={showHeat}
+            sliderRef={sliderRef}
+          />
           {!plan && <p className="empty">Routes, checkpoints, and the weather corridor show up here.</p>}
           <div
+            ref={sliderRef}
             className="slider"
             onPointerDown={(event) => event.stopPropagation()}
           >
