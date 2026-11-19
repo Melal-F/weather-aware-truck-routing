@@ -129,7 +129,7 @@ class ConcurrentViaTest(unittest.TestCase):
             body = json or {}
             coords = body["coordinates"]
             self.assertNotIn("alternative_routes", body)
-            self.assertEqual(timeout, 15)
+            self.assertEqual(timeout, (5, 20))
             if len(coords) == 3:
                 time.sleep(0.01 if _is_via(coords, fast) else 0.2)
                 with lock:
@@ -183,7 +183,7 @@ class ConcurrentWeatherTest(unittest.TestCase):
 
         def forecast(url, params=None, timeout=None):
             self.assertIn("open-meteo.com", url)
-            self.assertEqual(timeout, 20)
+            self.assertEqual(timeout, (5, 20))
             time.sleep(0.2)
             lats = [float(part) for part in str(params["latitude"]).split(",") if part]
             times = _hours()
