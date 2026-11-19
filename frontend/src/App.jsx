@@ -158,7 +158,7 @@ export default function App() {
   const [destQuery, setDestQuery] = useState("");
   const [destPick, setDestPick] = useState(null);
   const [departure, setDeparture] = useState(defaultDeparture);
-  const [load, setLoad] = useState("");
+  const [load, setLoad] = useState("42000");
   const [spacing, setSpacing] = useState("25");
   const [plan, setPlan] = useState(null);
   const [selected, setSelected] = useState(null);

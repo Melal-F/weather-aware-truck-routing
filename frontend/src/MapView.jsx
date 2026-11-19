@@ -22,6 +22,8 @@ const HeatLayer = L.Layer.extend({
     this._hourCache = new Map();
     this._cacheView = "";
     this._cacheCellPx = null;
+    this._cacheBlur = null;
+    this._cachePad = null;
     this._origin = null;
   },
 
@@ -83,13 +85,14 @@ const HeatLayer = L.Layer.extend({
 
   // Drawn low to high so the worst risk sits on top.
   // Each item is the center of a cell; the rect is cellDeg wide and tall.
-  _drawHour(ctx, ratio, hour) {
+  // User space is container pixels; the transform shifts drawing by +pad.
+  _drawHour(ctx, ratio, hour, pad) {
     const map = this._map;
     const size = map.getSize();
     const cell = this._cellDeg;
     const half = cell / 2;
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.clearRect(0, 0, size.x, size.y);
+    ctx.setTransform(ratio, 0, 0, ratio, pad * ratio, pad * ratio);
+    ctx.clearRect(-pad, -pad, size.x + pad * 2, size.y + pad * 2);
     const order = this._points
       .map((point, index) => ({ point, index, rank: LEVEL_RANK[point.risks[hour]] || 0 }))
       .sort((a, b) => a.rank - b.rank || a.index - b.index);
@@ -102,7 +105,7 @@ const HeatLayer = L.Layer.extend({
       const y = Math.min(nw.y, se.y);
       const w = Math.abs(se.x - nw.x);
       const h = Math.abs(se.y - nw.y);
-      if (w <= 0 || h <= 0 || x > size.x || y > size.y || x + w < 0 || y + h < 0) continue;
+      if (w <= 0 || h <= 0 || x > size.x + pad || y > size.y + pad || x + w < -pad || y + h < -pad) continue;
       ctx.fillStyle = rgba(RISK_COLORS[level] || "#8a8a8a", 0.45);
       ctx.fillRect(x, y, w, h);
     }
@@ -126,30 +129,41 @@ const HeatLayer = L.Layer.extend({
     if (!map || !canvas) return;
     const size = map.getSize();
     const ratio = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, size.x) * ratio;
-    canvas.height = Math.max(1, size.y) * ratio;
-    canvas.style.width = `${size.x}px`;
-    canvas.style.height = `${size.y}px`;
     const cellPx = this._cellPx();
-    canvas.style.filter = `blur(${Math.round(cellPx * 0.35)}px)`;
-    this._origin = map.containerPointToLayerPoint([0, 0]);
+    const blur = Math.min(24, Math.round(cellPx * 0.35));
+    const pad = 2 * blur;
+    const cssW = size.x + pad * 2;
+    const cssH = size.y + pad * 2;
+    canvas.width = Math.max(1, cssW) * ratio;
+    canvas.height = Math.max(1, cssH) * ratio;
+    canvas.style.width = `${cssW}px`;
+    canvas.style.height = `${cssH}px`;
+    canvas.style.filter = `blur(${blur}px)`;
+    this._origin = map.containerPointToLayerPoint([-pad, -pad]);
     L.DomUtil.setPosition(canvas, this._origin);
     const ctx = canvas.getContext("2d");
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!this._enabled) return;
     const view = this._viewKey();
-    if (view !== this._cacheView || cellPx !== this._cacheCellPx) {
+    if (
+      view !== this._cacheView ||
+      cellPx !== this._cacheCellPx ||
+      blur !== this._cacheBlur ||
+      pad !== this._cachePad
+    ) {
       this._hourCache.clear();
       this._cacheView = view;
       this._cacheCellPx = cellPx;
+      this._cacheBlur = blur;
+      this._cachePad = pad;
     }
     const frame = this._hourCache.get(this._hour);
     if (frame && frame.width === canvas.width && frame.height === canvas.height) {
       ctx.drawImage(frame, 0, 0);
       return;
     }
-    this._drawHour(ctx, ratio, this._hour);
+    this._drawHour(ctx, ratio, this._hour, pad);
     this._remember(this._hour, canvas);
   },
 });
@@ -163,6 +177,8 @@ function summaryHtml(route) {
 }
 
 const LABEL_DIRECTION = ["right", "left", "top"];
+const LABEL_W = 170;
+const LABEL_H = 70;
 
 function routePositions(route) {
   return route.segments.flatMap((segment) => segment.positions);
@@ -173,36 +189,101 @@ function samplePosition(positions, fraction) {
   return positions[Math.min(positions.length - 1, Math.max(0, index))];
 }
 
-// Samples 20%–80% every 5%. Picks the point farthest from every other route.
-function labelPoint(route, others, map) {
+function labelSamples(route) {
   const positions = routePositions(route);
   if (!positions.length) {
     const point = route.checkpoints[0];
-    return point ? [point.lat, point.lng] : null;
+    return point ? [[point.lat, point.lng]] : [];
   }
-  const otherPx = [];
-  for (const other of others) {
-    for (const position of routePositions(other)) {
-      otherPx.push(map.latLngToContainerPoint(position));
+  const samples = [];
+  for (let step = 4; step <= 16; step += 1) samples.push(samplePosition(positions, step / 20));
+  return samples;
+}
+
+// Tooltip box for a direction: right of the anchor, left of it, or above it.
+// The 6px shift matches Leaflet's direction margin plus the tooltip offset.
+function labelBox(at, direction) {
+  const w = LABEL_W;
+  const h = LABEL_H;
+  if (direction === "left") return { x: at.x - w - 6, y: at.y - h / 2 - 6, w, h };
+  if (direction === "top") return { x: at.x - w / 2, y: at.y - h - 12, w, h };
+  return { x: at.x + 6, y: at.y - h / 2 - 6, w, h };
+}
+
+function boxesOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Recommended route first, then the rest by id. One pass so later labels
+// see boxes already placed. Samples are 20%–80% every 5%.
+function placeLabels(routes, map) {
+  const spots = new Array(routes.length).fill(null);
+  if (!routes.length) return spots;
+  const recommended = routes.findIndex((route) => route.recommended);
+  const first = recommended < 0 ? 0 : recommended;
+  const order = [first];
+  routes
+    .map((route, index) => ({ index, id: route.id }))
+    .filter((item) => item.index !== first)
+    .sort((a, b) => a.id - b.id)
+    .forEach((item) => order.push(item.index));
+
+  const linePx = routes.map((route) =>
+    routePositions(route).map((position) => map.latLngToContainerPoint(position)),
+  );
+  const placed = [];
+
+  for (const index of order) {
+    const route = routes[index];
+    const positions = routePositions(route);
+    const samples = labelSamples(route);
+    if (!samples.length) continue;
+    const direction = LABEL_DIRECTION[index % 3];
+    const others = [];
+    linePx.forEach((pts, otherIndex) => {
+      if (otherIndex !== index) others.push(...pts);
+    });
+    if (!others.length && !placed.length && positions.length) {
+      const chosen = samplePosition(positions, 0.5);
+      const at = map.latLngToContainerPoint(chosen);
+      const box = labelBox(at, direction);
+      placed.push({ box, cx: box.x + box.w / 2, cy: box.y + box.h / 2 });
+      spots[index] = chosen;
+      continue;
     }
+    let best = null;
+    let bestScore = -1;
+    let free = null;
+    let freeScore = -1;
+    for (const sample of samples) {
+      const at = map.latLngToContainerPoint(sample);
+      let nearest = Infinity;
+      for (const pt of others) {
+        const dist = Math.hypot(at.x - pt.x, at.y - pt.y);
+        if (dist < nearest) nearest = dist;
+      }
+      for (const item of placed) {
+        const dist = Math.hypot(at.x - item.cx, at.y - item.cy);
+        if (dist < nearest) nearest = dist;
+      }
+      const box = labelBox(at, direction);
+      if (nearest > bestScore) {
+        bestScore = nearest;
+        best = sample;
+      }
+      if (!placed.some((item) => boxesOverlap(box, item.box)) && nearest > freeScore) {
+        freeScore = nearest;
+        free = sample;
+      }
+    }
+    const chosen = free || best;
+    if (!chosen) continue;
+    const at = map.latLngToContainerPoint(chosen);
+    const box = labelBox(at, direction);
+    placed.push({ box, cx: box.x + box.w / 2, cy: box.y + box.h / 2 });
+    spots[index] = chosen;
   }
-  if (!otherPx.length) return samplePosition(positions, 0.5);
-  let best = null;
-  let bestDist = -1;
-  for (let step = 4; step <= 16; step += 1) {
-    const sample = samplePosition(positions, step / 20);
-    const at = map.latLngToContainerPoint(sample);
-    let nearest = Infinity;
-    for (const pt of otherPx) {
-      const dist = (at.x - pt.x) ** 2 + (at.y - pt.y) ** 2;
-      if (dist < nearest) nearest = dist;
-    }
-    if (nearest > bestDist) {
-      bestDist = nearest;
-      best = sample;
-    }
-  }
-  return best;
+  return spots;
 }
 
 function popupHtml(point) {
@@ -278,8 +359,8 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
 
     const bounds = [];
     const labels = [];
+    const spots = placeLabels(plan.routes, map);
     plan.routes.forEach((route, index) => {
-      const others = plan.routes.filter((_, otherIndex) => otherIndex !== index);
       const lineGroup = L.featureGroup();
       route.segments.forEach((segment) => {
         const line = L.polyline(segment.positions, {
@@ -294,7 +375,7 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
         lineGroup.addLayer(line);
         segment.positions.forEach((position) => bounds.push(position));
       });
-      const mid = labelPoint(route, others, map);
+      const mid = spots[index];
       if (mid) {
         const label = L.circleMarker(mid, {
           pane: "checks",
@@ -345,15 +426,11 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
     labelsRef.current = labels;
 
     const onZoom = () => {
-      plan.routes.forEach((route, index) => {
+      const next = placeLabels(plan.routes, map);
+      plan.routes.forEach((_, index) => {
         const label = labels[index];
-        if (!label) return;
-        const at = labelPoint(
-          route,
-          plan.routes.filter((_, otherIndex) => otherIndex !== index),
-          map,
-        );
-        if (!at) return;
+        const at = next[index];
+        if (!label || !at) return;
         label.setLatLng(at);
         const tip = label.getTooltip();
         if (!tip) return;
