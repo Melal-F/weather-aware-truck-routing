@@ -1,9 +1,14 @@
 import copy
 import json
 import math
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
+
+import requests
+from urllib3.response import HTTPResponse
 
 from routing.geo import (
     EARTH_MILES,
@@ -13,6 +18,7 @@ from routing.geo import (
     place_checkpoints,
 )
 from routing.risk import classify, miles_by_level
+import routing.services as services
 from routing.services import PlanError, build_plan, open_meteo, parse_departure, routes_from_geojson
 
 
@@ -75,6 +81,59 @@ def _response(status, body):
             return body
 
     return Response()
+
+
+class _OneShot:
+    """Body that closes at EOF so urllib3's stream loop stops."""
+
+    def __init__(self, data):
+        self._data = data
+        self.closed = False
+
+    def read(self, amt=-1):
+        if self.closed:
+            return b""
+        if amt is None or amt < 0:
+            amt = len(self._data)
+        chunk = self._data[:amt]
+        self._data = self._data[amt:]
+        if not self._data:
+            self.closed = True
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+    def isclosed(self):
+        return self.closed
+
+
+def _forecast_http(url):
+    query = parse_qs(urlsplit(url).query)
+    lats = query["latitude"][0].split(",")
+    hours = hours_from(datetime(2026, 11, 18, tzinfo=timezone.utc), 96)
+    count = len(hours)
+    rows = []
+    for _lat in lats:
+        rows.append(
+            {
+                "hourly": {
+                    "time": hours,
+                    "wind_speed_10m": [5.0] * count,
+                    "rain": [0.0] * count,
+                    "showers": [0.0] * count,
+                    "snowfall": [0.0] * count,
+                }
+            }
+        )
+    return HTTPResponse(
+        body=_OneShot(json.dumps(rows).encode()),
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "application/json"},
+        preload_content=False,
+        decode_content=False,
+    )
 
 
 def _meridian(lat, lng, miles, steps):
@@ -250,12 +309,13 @@ class BuildPlanTest(unittest.TestCase):
                     missing.append(rounded)
         self.assertEqual(missing, [])
 
-    @patch("routing.services.requests.get")
+    @patch("routing.services.session.get")
     def test_long_trip_uses_coarser_cells_under_the_weather_cap(self, get):
         sent = []
         hours = hours_from(datetime(2026, 11, 18, tzinfo=timezone.utc), 96)
 
         def forecast(url, params=None, timeout=None):
+            self.assertEqual(timeout, (5, 20))
             lats = [part for part in str(params["latitude"]).split(",") if part]
             lngs = [part for part in str(params["longitude"]).split(",") if part]
             sent.extend(zip(lats, lngs))
@@ -341,6 +401,89 @@ class BuildPlanTest(unittest.TestCase):
         before = len(json.dumps(before_plan))
         after = len(json.dumps(plan))
         self.assertLess(after, before)
+
+    def test_open_meteo_connect_timeout_is_retried_by_the_session(self):
+        gets = {"n": 0}
+        attempts = {"n": 0}
+        lock = threading.Lock()
+        original_get = services.session.get
+
+        def counting_get(*args, **kwargs):
+            with lock:
+                gets["n"] += 1
+            self.assertEqual(kwargs.get("timeout"), (5, 20))
+            self.assertIn("open-meteo.com", args[0])
+            return original_get(*args, **kwargs)
+
+        def flaky_make_request(_pool, _conn, _method, url, *_args, **_kwargs):
+            with lock:
+                attempts["n"] += 1
+                first = attempts["n"] == 1
+            if first:
+                raise requests.ConnectTimeout("connect timed out")
+            return _forecast_http(url)
+
+        # Env proxies would tunnel before _make_request and never hit the flaky transport.
+        previous_trust = services.session.trust_env
+        services.session.trust_env = False
+        try:
+            with patch.object(services.session, "get", counting_get), patch(
+                "urllib3.connectionpool.HTTPConnectionPool._make_request",
+                flaky_make_request,
+            ):
+                plan = build_plan(payload(), two_routes, open_meteo)
+        finally:
+            services.session.trust_env = previous_trust
+
+        self.assertGreaterEqual(attempts["n"], 2)
+        self.assertEqual(attempts["n"], gets["n"] + 1)
+        self.assertEqual(len(plan["routes"]), 2)
+        self.assertEqual(plan["forecast_start"], "2026-11-18T12:00:00+00:00")
+
+    def test_failed_weather_chunk_leaves_the_earlier_chunk_cached(self):
+        from django.core.cache import cache
+
+        points = [(float(index), -100.0) for index in range(-40, 61)]
+        self.assertEqual(len(points), 101)
+        start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        end = start + timedelta(days=2)
+        hours = hours_from(start, 96)
+
+        def forecast(url, params=None, timeout=None):
+            self.assertEqual(timeout, (5, 20))
+            lats = [float(part) for part in str(params["latitude"]).split(",") if part]
+            if max(lats) >= 60:
+                raise requests.ConnectTimeout("connect timed out")
+            count = len(hours)
+            rows = []
+            for _lat in lats:
+                rows.append(
+                    {
+                        "hourly": {
+                            "time": hours,
+                            "wind_speed_10m": [5.0] * count,
+                            "rain": [0.0] * count,
+                            "showers": [1.0] * count,
+                            "snowfall": [0.0] * count,
+                        }
+                    }
+                )
+            return _response(200, rows[0] if len(rows) == 1 else rows)
+
+        with patch("routing.services.session.get", side_effect=forecast):
+            with self.assertRaises(requests.ConnectTimeout):
+                open_meteo(points, start, end)
+
+        start_date = start.date().isoformat()
+        end_date = end.date().isoformat()
+        for lat, lng in points[:100]:
+            key = f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+            cached = cache.get(key)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["rain"][0], 1.0)
+        lat, lng = points[100]
+        missed = f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+        self.assertIsNone(cache.get(missed))
 
 
 class GeoJsonTest(unittest.TestCase):

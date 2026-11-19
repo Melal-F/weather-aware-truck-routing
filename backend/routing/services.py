@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from django.core.cache import cache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from routing.geo import (
     _thin,
@@ -36,6 +38,39 @@ WEATHER_CHUNK = 100
 WEATHER_CACHE_SECONDS = 1800
 MAX_WEATHER_LOCATIONS = 350
 logger = logging.getLogger(__name__)
+# GET retries live on the adapter. POST shares the session and timeouts only.
+_adapter = HTTPAdapter(
+    max_retries=Retry(
+        total=2,
+        connect=2,
+        read=1,
+        backoff_factor=0.5,
+        status_forcelist=[502, 503, 504],
+        allowed_methods=["GET"],
+    )
+)
+# Older tests replace requests.get/post. Honor that; otherwise use this session.
+_raw_get = requests.get
+_raw_post = requests.post
+
+
+class _RoutingSession(requests.Session):
+    def get(self, url, **kwargs):
+        current = requests.get
+        if current is not _raw_get:
+            return current(url, **kwargs)
+        return super().get(url, **kwargs)
+
+    def post(self, url, **kwargs):
+        current = requests.post
+        if current is not _raw_post:
+            return current(url, **kwargs)
+        return super().post(url, **kwargs)
+
+
+session = _RoutingSession()
+session.mount("https://", _adapter)
+session.mount("http://", _adapter)
 # ORS rejects alternative_routes once the crow-flies trip is longer than this.
 ALTERNATIVES_MAX_KM = 90
 VIA_FRACTIONS = (0.08, 0.15, 0.25)
@@ -288,11 +323,11 @@ def _ors_headers(key):
 
 def _ors_call(profile, coordinates, load_lb, key, alternatives):
     """Returns (routes, status) where status is ok, refused, unauthorized, or error."""
-    response = requests.post(
+    response = session.post(
         ORS_URL.format(profile=profile),
         json=_ors_body(coordinates, load_lb if profile == "driving-hgv" else None, alternatives),
         headers=_ors_headers(key),
-        timeout=15,
+        timeout=(5, 20),
     )
     if response.status_code in (400, 403, 404):
         return [], "refused"
@@ -408,7 +443,7 @@ def ors_autocomplete(query):
             "ORS_API_KEY is not set. Add a free OpenRouteService key and restart.",
             status=500,
         )
-    response = requests.get(
+    response = session.get(
         "https://api.openrouteservice.org/geocode/autocomplete",
         params={"api_key": key, "text": text},
         timeout=10,
@@ -445,7 +480,7 @@ def ors_autocomplete(query):
 
 
 def _forecast_chunk(chunk, start, end):
-    response = requests.get(
+    response = session.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": ",".join(f"{lat:.5f}" for lat, _lng in chunk),
@@ -456,7 +491,7 @@ def _forecast_chunk(chunk, start, end):
             "start_date": start.date().isoformat(),
             "end_date": end.date().isoformat(),
         },
-        timeout=20,
+        timeout=(5, 20),
     )
     if response.status_code == 429:
         raise PlanError(
@@ -500,6 +535,10 @@ def _forecast_chunk(chunk, start, end):
                 "snowfall": hourly.get("snowfall") or [],
             }
         )
+    start_date = start.date().isoformat()
+    end_date = end.date().isoformat()
+    for (lat, lng), row in zip(chunk, rows):
+        cache.set(_weather_cache_key(lat, lng, start_date, end_date), row, WEATHER_CACHE_SECONDS)
     return rows
 
 
@@ -541,8 +580,7 @@ def open_meteo(points, start, end):
         for future, index in futures.items():
             parts[index] = future.result()
     flat = [row for part in parts for row in part]
-    for (index, lat, lng), row in zip(misses, flat):
-        cache.set(_weather_cache_key(lat, lng, start_date, end_date), row, WEATHER_CACHE_SECONDS)
+    for (index, _lat, _lng), row in zip(misses, flat):
         series[index] = row
     return series
 

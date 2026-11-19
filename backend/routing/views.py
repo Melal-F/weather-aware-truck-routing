@@ -1,8 +1,12 @@
+import logging
+
 import requests
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from routing.services import PlanError, build_plan, open_meteo, ors_autocomplete, ors_routes
+
+logger = logging.getLogger(__name__)
 
 
 class GeocodeView(APIView):
@@ -29,5 +33,6 @@ class PlanView(APIView):
         except PlanError as exc:
             return Response({"error": str(exc)}, status=exc.status)
         except requests.RequestException:
+            logger.exception("plan upstream failure")
             return Response({"error": "A routing or weather service is unavailable right now."}, status=502)
         return Response(plan)
