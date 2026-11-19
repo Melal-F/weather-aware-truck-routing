@@ -125,4 +125,12 @@ The repo is a Docker web service. The image builds the React app, then gunicorn 
 
 `docker compose up --build` is the same image locally, on http://127.0.0.1:8000.
 
+## Deploy to Render
+
+Connect the repo in the Render dashboard. Render picks up `render.yaml` and creates the free Docker web service. Set `ORS_API_KEY` when Render asks for it. After deploy, put the service URL on the Live demo line above.
+
+## Known limits
+
+Open-Meteo free tier allows 600 locations per minute; corridor cells grow from 0.2° to 0.3° on long trips so a plan stays within 350 weather locations.
+
 The walkthrough script is in [LOOM.md](LOOM.md).
