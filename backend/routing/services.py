@@ -543,7 +543,7 @@ def _forecast_chunk(chunk, start, end):
 
 
 def _weather_cache_key(lat, lng, start_date, end_date):
-    return f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+    return f"wx:{lat:.2f}:{lng:.2f}:{start_date}:{end_date}"
 
 
 def open_meteo(points, start, end):
@@ -585,8 +585,13 @@ def open_meteo(points, start, end):
     return series
 
 
+def checkpoint_weather_key(lat, lng):
+    """0.01°, about 1 km. Checkpoints only."""
+    return (round(lat, 2), round(lng, 2))
+
+
 def weather_key(lat, lng):
-    """0.1° cell, about 11 km."""
+    """0.1° cell, about 11 km. Corridor heatmap only."""
     return (round(lat, 1), round(lng, 1))
 
 
@@ -670,11 +675,18 @@ def build_plan(payload, fetch_routes, fetch_weather):
     seen_checkpoints = set()
     for draft in drafts:
         for checkpoint in draft["checkpoints"]:
-            key = weather_key(checkpoint["lat"], checkpoint["lng"])
+            key = checkpoint_weather_key(checkpoint["lat"], checkpoint["lng"])
             if key in seen_checkpoints:
                 continue
             seen_checkpoints.add(key)
             checkpoint_keys.append(key)
+    if len(checkpoint_keys) > MAX_WEATHER_LOCATIONS:
+        logger.warning(
+            "Checkpoint weather cells (%s) exceed %s; later checkpoints and the corridor are skipped",
+            len(checkpoint_keys),
+            MAX_WEATHER_LOCATIONS,
+        )
+        checkpoint_keys = checkpoint_keys[:MAX_WEATHER_LOCATIONS]
 
     corridor_deg, corridor_cells = _corridor_for_budget(
         [draft["coords"] for draft in drafts],
@@ -705,14 +717,19 @@ def build_plan(payload, fetch_routes, fetch_weather):
         )
     by_key = {key: hourly for key, hourly in zip(points, series)}
 
-    def weather(lat, lng, moment):
-        return reading_at(by_key[weather_key(lat, lng)], moment)
+    def weather(lat, lng, moment, key_fn):
+        row = by_key.get(key_fn(lat, lng))
+        if row is None:
+            return None, None, None
+        return reading_at(row, moment)
 
     routes = []
     for index, draft in enumerate(drafts):
         checkpoints = []
         for checkpoint in draft["checkpoints"]:
-            wind, rain, snow = weather(checkpoint["lat"], checkpoint["lng"], checkpoint["eta"])
+            wind, rain, snow = weather(
+                checkpoint["lat"], checkpoint["lng"], checkpoint["eta"], checkpoint_weather_key,
+            )
             scored = classify(wind, rain, snow, load_lb)
             checkpoints.append(
                 {
@@ -749,7 +766,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
     for lat, lng in corridor_cells:
         risks = []
         for hour in range(FORECAST_HOURS):
-            wind, rain, snow = weather(lat, lng, start + timedelta(hours=hour))
+            wind, rain, snow = weather(lat, lng, start + timedelta(hours=hour), weather_key)
             risks.append(classify(wind, rain, snow, load_lb)["level"])
         corridor_out.append({"lat": round(lat, 5), "lng": round(lng, 5), "risks": risks})
 

@@ -477,12 +477,12 @@ class BuildPlanTest(unittest.TestCase):
         start_date = start.date().isoformat()
         end_date = end.date().isoformat()
         for lat, lng in points[:100]:
-            key = f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+            key = f"wx:{lat:.2f}:{lng:.2f}:{start_date}:{end_date}"
             cached = cache.get(key)
             self.assertIsNotNone(cached)
             self.assertEqual(cached["rain"][0], 1.0)
         lat, lng = points[100]
-        missed = f"wx:{lat:.1f}:{lng:.1f}:{start_date}:{end_date}"
+        missed = f"wx:{lat:.2f}:{lng:.2f}:{start_date}:{end_date}"
         self.assertIsNone(cache.get(missed))
 
 

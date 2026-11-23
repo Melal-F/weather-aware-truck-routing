@@ -42,8 +42,13 @@ def _long_routes(_origin, _destination, _load_lb=None):
 
 
 def _short_route(_origin, _destination, _load_lb=None):
-    # About 2 km apart, so both ends snap to the same 0.1° weather cell.
-    return [{"coords": [(41.0, -87.6), (41.018, -87.6)], "duration_seconds": 600}]
+    # 0.004° apart, so both ends round to the same 0.01° checkpoint.
+    return [{"coords": [(41.0, -87.6), (41.004, -87.6)], "duration_seconds": 600}]
+
+
+def _split_route(_origin, _destination, _load_lb=None):
+    # 0.04° apart, so each end keeps its own 0.01° checkpoint.
+    return [{"coords": [(41.0, -87.6), (41.04, -87.6)], "duration_seconds": 600}]
 
 
 def _body(**overrides):
@@ -96,22 +101,27 @@ class WeatherBudgetTest(unittest.TestCase):
         self._stub_forecast(get, sent)
         plan = build_plan(_body(), _long_routes, open_meteo)
         unique = set(sent)
-        self.assertLessEqual(len(unique), 350)
-        self.assertTrue(plan["corridor"])
-        self.assertIn(plan["corridor_cell_deg"], (0.25, 0.3))
-        self.assertTrue(all(len(point["risks"]) == 49 for point in plan["corridor"]))
+        self.assertEqual(len(unique), 350)
+        # Checkpoint cells fill the budget, so the corridor is not fetched.
+        self.assertEqual(plan["corridor"], [])
+        self.assertEqual(plan["corridor_cell_deg"], 0.3)
+        scored = 0
         for route in plan["routes"]:
             self.assertTrue(route["checkpoints"])
             for checkpoint in route["checkpoints"]:
+                if checkpoint["wind_mph"] is None:
+                    self.assertIsNone(checkpoint["level"])
+                    continue
+                scored += 1
                 self.assertIn(checkpoint["level"], ("Low", "Moderate", "High", "Severe", "No Travel"))
-                self.assertIsNotNone(checkpoint["wind_mph"])
                 self.assertIsNotNone(checkpoint["rain_in_hr"])
+        self.assertGreater(scored, 0)
         calls = get.call_count
         self.assertGreater(calls, 0)
         again = build_plan(_body(), _long_routes, open_meteo)
         self.assertEqual(get.call_count, calls)
-        self.assertIn(again["corridor_cell_deg"], (0.25, 0.3))
-        self.assertTrue(again["corridor"])
+        self.assertEqual(again["corridor"], [])
+        self.assertEqual(again["corridor_cell_deg"], 0.3)
 
     @patch("routing.services.requests.get")
     def test_checkpoints_two_km_apart_share_one_location(self, get):
@@ -132,7 +142,7 @@ class WeatherBudgetTest(unittest.TestCase):
             (checkpoints[0]["lat"], checkpoints[0]["lng"]),
             (checkpoints[1]["lat"], checkpoints[1]["lng"]),
         ) * 1.609344
-        self.assertAlmostEqual(gap_km, 2.0, delta=0.3)
+        self.assertAlmostEqual(gap_km, 0.44, delta=0.15)
         self.assertEqual(checkpoints[0]["wind_mph"], checkpoints[1]["wind_mph"])
         self.assertEqual(checkpoints[0]["rain_in_hr"], checkpoints[1]["rain_in_hr"])
         self.assertEqual(checkpoints[0]["wind_mph"], 12.0)
@@ -143,6 +153,34 @@ class WeatherBudgetTest(unittest.TestCase):
             if abs(float(pair[0]) - 41.0) < 0.05 and abs(float(pair[1]) + 87.6) < 0.05
         ]
         self.assertEqual(len(near), 1)
+        self.assertEqual(plan["corridor_cell_deg"], 0.2)
+
+    @patch("routing.services.requests.get")
+    def test_checkpoints_four_hundredths_apart_are_separate(self, get):
+        sent = []
+        self._stub_forecast(get, sent)
+        plan = build_plan(
+            _body(
+                origin={"name": "A", "lat": 41.0, "lng": -87.6},
+                destination={"name": "B", "lat": 41.04, "lng": -87.6},
+                spacing_miles=10,
+            ),
+            _split_route,
+            open_meteo,
+        )
+        checkpoints = plan["routes"][0]["checkpoints"]
+        self.assertGreaterEqual(len(checkpoints), 2)
+        fetched = {
+            (round(float(lat), 2), round(float(lng), 2))
+            for lat, lng in set(sent)
+        }
+        self.assertIn((41.0, -87.6), fetched)
+        self.assertIn((41.04, -87.6), fetched)
+        for lat, lng in fetched:
+            if (lat, lng) in ((41.0, -87.6), (41.04, -87.6)):
+                continue
+            self.assertEqual(lat, round(lat, 1))
+            self.assertEqual(lng, round(lng, 1))
         self.assertEqual(plan["corridor_cell_deg"], 0.2)
 
     @patch("routing.services.requests.get")
