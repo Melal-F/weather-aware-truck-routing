@@ -414,13 +414,18 @@ export default function MapView({
     map.getPane("checks").style.zIndex = 460;
     map.setView([39.8, -98.6], 4);
     mapRef.current = map;
-    const onResize = () => map.invalidateSize();
+    let frame = 0;
+    const onResize = () => {
+      if (!mapRef.current) return;
+      map.invalidateSize();
+    };
     window.addEventListener("resize", onResize);
-    requestAnimationFrame(onResize);
+    frame = requestAnimationFrame(onResize);
     return () => {
+      cancelAnimationFrame(frame);
+      mapRef.current = null;
       window.removeEventListener("resize", onResize);
       map.remove();
-      mapRef.current = null;
       layersRef.current = null;
     };
   }, []);
