@@ -381,6 +381,7 @@ export default function MapView({
     const map = L.map(node.current, {
       preferCanvas: true,
       zoomControl: false,
+      fadeAnimation: false,
     });
     const streets = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
       subdomains: "abcd",
