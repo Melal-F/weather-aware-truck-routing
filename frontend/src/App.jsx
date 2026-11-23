@@ -334,28 +334,46 @@ function RouteCard({ route, plan, selected, onSelect }) {
   );
 }
 
+function localDay(iso) {
+  const date = new Date(iso);
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
 function Checkpoints({ route, onHover, onFocus }) {
   return (
     <section>
-      <div className="section-head">
-        <h2>Checkpoints · Route {routeLetter(route.id)}</h2>
+      <div className="section-head checks-head">
+        <div>
+          <h2>Checkpoints · Route {routeLetter(route.id)}</h2>
+          <p className="units">Wind mph · Rain and snow in/h</p>
+        </div>
         <span>{route.checkpoints.length}</span>
       </div>
       <div className="table-wrap">
         <table className="checks">
+          <colgroup>
+            <col className="c-mile" />
+            <col className="c-eta" />
+            <col className="c-wind" />
+            <col className="c-rain" />
+            <col className="c-snow" />
+            <col className="c-risk" />
+          </colgroup>
           <thead>
             <tr>
               <th className="num">Mile</th>
               <th>ETA</th>
-              <th className="num">Wind (mph)</th>
-              <th className="num">Rain (in/h)</th>
-              <th className="num">Snow (in/h)</th>
+              <th className="num">Wind</th>
+              <th className="num">Rain</th>
+              <th className="num">Snow</th>
               <th>Risk</th>
             </tr>
           </thead>
           <tbody>
             {route.checkpoints.map((point, index) => {
               const level = point.level;
+              const previous = route.checkpoints[index - 1];
+              const showDay = !previous || localDay(previous.eta) !== localDay(point.eta);
               const riskStyle = !level || level === "Low"
                 ? undefined
                 : {
@@ -376,7 +394,10 @@ function Checkpoints({ route, onHover, onFocus }) {
                   }}
                 >
                   <td className="num">{reading(point.mile) ?? "—"}</td>
-                  <td>{formatDayClock(point.eta)}</td>
+                  <td className="eta">
+                    {showDay && <span className="eta-day">{formatWeekday(point.eta)}</span>}
+                    {formatClock(point.eta)}
+                  </td>
                   <td className="num">{reading(point.wind_mph) == null ? <span className="missing">—</span> : reading(point.wind_mph)}</td>
                   <td className="num">{reading(point.rain_in_hr) == null ? <span className="missing">—</span> : reading(point.rain_in_hr)}</td>
                   <td className="num">{reading(point.snow_in_hr) == null ? <span className="missing">—</span> : reading(point.snow_in_hr)}</td>

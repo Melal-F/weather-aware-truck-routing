@@ -137,6 +137,14 @@ aside {
   margin-bottom: 12px;
 }
 
+.checks-head { align-items: start; }
+
+.units {
+  margin-top: 2px;
+  font: var(--t-small);
+  color: var(--text-3);
+}
+
 .section-head h2,
 .trip-heading {
   font: var(--t-label);
@@ -550,19 +558,26 @@ input.invalid { border-color: var(--danger-text); }
   border-radius: 50%;
 }
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: hidden; }
 
 .checks {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font: var(--t-small);
 }
+
+.checks .c-mile,
+.checks .c-wind,
+.checks .c-rain,
+.checks .c-snow { width: 44px; }
+.checks .c-eta { width: 72px; }
 
 .checks th {
   position: sticky;
   top: 0;
   height: 32px;
-  padding: 0 8px;
+  padding: 0 2px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   color: var(--text-3);
@@ -573,9 +588,12 @@ input.invalid { border-color: var(--danger-text); }
 
 .checks td {
   height: 32px;
-  padding: 0 8px;
+  padding: 0 2px;
   white-space: nowrap;
 }
+
+.checks td.eta { height: auto; padding-top: 6px; padding-bottom: 6px; }
+.eta-day { display: block; color: var(--text-2); }
 
 .checks tbody tr + tr td { border-top: 1px solid var(--border); }
 .checks tbody tr:hover { background: var(--surface-2); }
