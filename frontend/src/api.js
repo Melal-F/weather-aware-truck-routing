@@ -1,12 +1,72 @@
 export const RISK_LEVELS = ["Low", "Moderate", "High", "Severe", "No Travel"];
 
 export const RISK_COLORS = {
-  Low: "#2e7d32",
-  Moderate: "#f9a825",
-  High: "#ef6c00",
-  Severe: "#c62828",
-  "No Travel": "#161616",
+  Low: "#3B8F5A",
+  Moderate: "#E0A100",
+  High: "#E8590C",
+  Severe: "#D92D20",
+  "No Travel": "#101828",
+  Unassessed: "#98A2B3",
 };
+
+export function routeLetter(id) {
+  return String.fromCharCode(65 + Number(id || 0));
+}
+
+export function formatDrive(seconds) {
+  const whole = Math.max(0, Math.round(Number(seconds) || 0));
+  let hours = Math.floor(whole / 3600);
+  let minutes = Math.round((whole % 3600) / 60);
+  if (minutes === 60) {
+    hours += 1;
+    minutes = 0;
+  }
+  if (hours <= 0) return `${minutes} m`;
+  return `${hours} h ${minutes} m`;
+}
+
+export function formatClock(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
+}
+
+export function formatWeekday(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date);
+}
+
+export function formatDayClock(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date).replace(/,/g, "");
+}
+
+export function formatTripStamp(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+export function dayOffset(fromIso, toIso) {
+  const from = new Date(fromIso);
+  const to = new Date(toIso);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return 0;
+  const start = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const end = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+  return Math.round((end.getTime() - start.getTime()) / 86400000);
+}
 
 export function formatWhen(iso) {
   if (!iso) return "—";
@@ -24,8 +84,12 @@ export function formatWhen(iso) {
 
 export function formatDuration(seconds) {
   const whole = Math.max(0, Math.round(seconds));
-  const hours = Math.floor(whole / 3600);
-  const minutes = Math.round((whole % 3600) / 60);
+  let hours = Math.floor(whole / 3600);
+  let minutes = Math.round((whole % 3600) / 60);
+  if (minutes === 60) {
+    hours += 1;
+    minutes = 0;
+  }
   if (hours <= 0) return `${minutes} min`;
   return `${hours} h ${minutes} min`;
 }

@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import L from "leaflet";
-import { RISK_COLORS, formatDuration, formatWhen } from "./api";
+import { RISK_COLORS, formatClock, formatDayClock, formatDrive, routeLetter } from "./api";
 
 function rgba(hex, alpha) {
   const value = Number.parseInt(hex.slice(1), 16);
@@ -41,7 +41,8 @@ const HeatLayer = L.Layer.extend({
     this._map = map;
     this._canvas = L.DomUtil.create("canvas", "corridor-heat leaflet-zoom-hide");
     this._canvas.style.pointerEvents = "none";
-    map.getPanes().overlayPane.appendChild(this._canvas);
+    const pane = map.getPane("corridor") || map.getPanes().overlayPane;
+    pane.appendChild(this._canvas);
     this._onMove = () => {
       if (this._origin) L.DomUtil.setPosition(this._canvas, this._origin);
     };
@@ -106,7 +107,7 @@ const HeatLayer = L.Layer.extend({
       const w = Math.abs(se.x - nw.x);
       const h = Math.abs(se.y - nw.y);
       if (w <= 0 || h <= 0 || x > size.x + pad || y > size.y + pad || x + w < -pad || y + h < -pad) continue;
-      ctx.fillStyle = rgba(RISK_COLORS[level] || "#8a8a8a", 0.45);
+      ctx.fillStyle = rgba(RISK_COLORS[level] || RISK_COLORS.Unassessed, 0.45);
       ctx.fillRect(x, y, w, h);
     }
   },
@@ -168,17 +169,26 @@ const HeatLayer = L.Layer.extend({
   },
 });
 
-function summaryHtml(route) {
-  const risk = route.average_risk == null ? "—" : Number(route.average_risk).toFixed(2);
-  const badge = route.recommended ? " · Recommended" : "";
-  const severe = Number(route.miles?.Severe || 0).toFixed(1);
-  const high = Number(route.miles?.High || 0).toFixed(1);
-  return `<div class="route-tip"><strong>Route ${route.id + 1}${badge}</strong><div>${Number(route.distance_miles).toFixed(0)} mi · ${formatDuration(route.duration_seconds)}</div><div>Severe ${severe} mi · High ${high} mi</div><div>Average risk ${risk}</div></div>`;
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[ch]));
+}
+
+function chipHtml(route) {
+  const check = route.recommended
+    ? `<svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.2 6.2 11.2 13 4.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+    : "";
+  return `<span class="chip">${check}<span>${esc(routeLetter(route.id))} · ${esc(formatDrive(route.duration_seconds))}</span></span>`;
 }
 
 const LABEL_DIRECTION = ["right", "left", "top"];
-const LABEL_W = 170;
-const LABEL_H = 70;
+const LABEL_W = 88;
+const LABEL_H = 24;
 
 function routePositions(route) {
   return route.segments.flatMap((segment) => segment.positions);
@@ -286,26 +296,68 @@ function placeLabels(routes, map) {
   return spots;
 }
 
+function dot(level, size) {
+  const color = RISK_COLORS[level] || RISK_COLORS.Unassessed;
+  return `<i class="dot" style="width:${size}px;height:${size}px;background:${color}"></i>`;
+}
+
 function popupHtml(point) {
-  const reading = (label, value, unit, level) => {
-    const shown = value == null ? "—" : `${value} ${unit}`;
-    return `<div>${label} ${shown}${level ? ` · ${level}` : ""}</div>`;
+  const mile = Math.round(Number(point.mile) || 0);
+  const level = point.level ? `${dot(point.level, 8)}<span>${esc(point.level)}</span>` : "No data";
+  const row = (label, value, unit, own) => {
+    const shown = value == null ? "—" : `${esc(value)} ${unit}`;
+    const mark = own ? dot(own, 6) : "";
+    return `<div class="wx-row"><dt>${label}</dt><dd><span>${shown}</span>${mark}</dd></div>`;
   };
   return `
     <div class="popup">
-      <strong>Mile ${Number(point.mile).toFixed(1)}</strong>
-      <div>${formatWhen(point.eta)}</div>
-      <div class="popup-level">${point.level || "No data"}</div>
-      ${reading("Wind", point.wind_mph, "mph", point.wind_level)}
-      ${reading("Rain", point.rain_in_hr, "in/hr", point.rain_level)}
-      ${reading("Snow", point.snow_in_hr, "in/hr", point.snow_level)}
+      <button type="button" class="popup-close" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4 4 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <div class="popup-top"><strong>Mile ${mile}</strong><span class="popup-risk">${level}</span></div>
+      <div class="popup-eta">${esc(formatDayClock(point.eta))}</div>
+      <dl class="wx">
+        ${row("Wind", point.wind_mph, "mph", point.wind_level)}
+        ${row("Rain", point.rain_in_hr, "in/hr", point.rain_level)}
+        ${row("Snow", point.snow_in_hr, "in/hr", point.snow_level)}
+      </dl>
     </div>
   `;
 }
 
-export default function MapView({ plan, selected, hour, onSelect, showHeat = true, sliderRef }) {
+function tipLine(point) {
+  const mile = Math.round(Number(point.mile) || 0);
+  return `Mile ${mile} · ${formatClock(point.eta)} · ${point.level || "No data"}`;
+}
+
+function token(name, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function IconButton({ label, onClick, children }) {
+  return (
+    <button type="button" aria-label={label} onClick={onClick}>
+      {children}
+    </button>
+  );
+}
+
+export default function MapView({
+  plan,
+  selected,
+  hour,
+  onSelect,
+  showHeat = true,
+  sliderRef,
+  loading = false,
+  highlightCheckpoint = null,
+  focusCheckpoint = null,
+}) {
   const node = useRef(null);
   const mapRef = useRef(null);
+  const layersRef = useRef(null);
+  const layerBoxRef = useRef(null);
   const heatRef = useRef(null);
   const linesRef = useRef([]);
   const marksRef = useRef([]);
@@ -313,19 +365,48 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
   const hourRef = useRef(hour);
   const showRef = useRef(showHeat);
   const onSelectRef = useRef(onSelect);
+  const selectedRef = useRef(selected);
+  const loadingRef = useRef(loading);
+  const highlightRef = useRef(highlightCheckpoint);
+  const [base, setBase] = useState("map");
+  const [menu, setMenu] = useState(false);
   hourRef.current = hour;
   showRef.current = showHeat;
   onSelectRef.current = onSelect;
+  selectedRef.current = selected;
+  loadingRef.current = loading;
+  highlightRef.current = highlightCheckpoint;
 
   useEffect(() => {
     const map = L.map(node.current, {
       preferCanvas: true,
-      zoomControl: true,
+      zoomControl: false,
     });
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    const streets = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+      subdomains: "abcd",
       maxZoom: 19,
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    }).addTo(map);
+      attribution: "© OpenStreetMap contributors © CARTO",
+    });
+    const satellite = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      {
+        maxZoom: 19,
+        attribution:
+          "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+      },
+    );
+    map.createPane("labels");
+    map.getPane("labels").style.zIndex = 350;
+    map.getPane("labels").style.pointerEvents = "none";
+    const placeNames = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+      { maxZoom: 19, pane: "labels" },
+    );
+    map.createPane("corridor");
+    map.getPane("corridor").style.zIndex = 250;
+    map.getPane("corridor").style.pointerEvents = "none";
+    streets.addTo(map);
+    layersRef.current = { streets, satellite, placeNames };
     map.createPane("routes");
     map.getPane("routes").style.zIndex = 450;
     map.createPane("checks");
@@ -339,8 +420,34 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
       window.removeEventListener("resize", onResize);
       map.remove();
       mapRef.current = null;
+      layersRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layers = layersRef.current;
+    if (!map || !layers) return;
+    const { streets, satellite, placeNames } = layers;
+    if (base === "satellite") {
+      if (map.hasLayer(streets)) map.removeLayer(streets);
+      satellite.addTo(map);
+      placeNames.addTo(map);
+    } else {
+      if (map.hasLayer(satellite)) map.removeLayer(satellite);
+      if (map.hasLayer(placeNames)) map.removeLayer(placeNames);
+      streets.addTo(map);
+    }
+  }, [base]);
+
+  useEffect(() => {
+    if (!menu) return undefined;
+    const close = (event) => {
+      if (!layerBoxRef.current?.contains(event.target)) setMenu(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [menu]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -357,27 +464,58 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
       };
     }
 
+    const text = token("--text", "#101828");
+    const muted = token("--text-3", "#98A2B3");
+    const surface = token("--surface", "#FFFFFF");
     const bounds = [];
     const labels = [];
     const spots = placeLabels(plan.routes, map);
     plan.routes.forEach((route, index) => {
-      const lineGroup = L.featureGroup();
-      route.segments.forEach((segment) => {
+      const positions = routePositions(route);
+      const gray = L.polyline(positions, {
+        pane: "routes",
+        color: muted,
+        weight: 3,
+        opacity: 0.9,
+        lineCap: "round",
+        lineJoin: "round",
+      });
+      gray.on("mouseover", () => {
+        if (selectedRef.current === route.id || loadingRef.current) return;
+        gray.setStyle({ weight: 4 });
+      });
+      gray.on("mouseout", () => {
+        if (selectedRef.current === route.id) return;
+        gray.setStyle({ weight: 3 });
+      });
+      gray.on("click", () => onSelectRef.current?.(route.id));
+      const casing = L.polyline(positions, {
+        pane: "routes",
+        color: surface,
+        weight: 9,
+        opacity: 0,
+        interactive: false,
+        lineCap: "round",
+        lineJoin: "round",
+      });
+      const segments = route.segments.map((segment) => {
         const line = L.polyline(segment.positions, {
           pane: "routes",
-          color: RISK_COLORS[segment.level] || "#8a8a8a",
+          color: RISK_COLORS[segment.level] || RISK_COLORS.Unassessed,
           weight: 5,
-          opacity: 0.9,
+          opacity: 0,
           lineCap: "round",
           lineJoin: "round",
         });
         line.on("click", () => onSelectRef.current?.(route.id));
-        lineGroup.addLayer(line);
         segment.positions.forEach((position) => bounds.push(position));
+        return line;
       });
+      const lineGroup = L.featureGroup([gray, casing, ...segments]);
       const mid = spots[index];
+      let label = null;
       if (mid) {
-        const label = L.circleMarker(mid, {
+        label = L.circleMarker(mid, {
           pane: "checks",
           radius: 1,
           opacity: 0,
@@ -386,7 +524,7 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
           summary: true,
           routeId: route.id,
         });
-        label.bindTooltip(summaryHtml(route), {
+        label.bindTooltip(chipHtml(route), {
           permanent: true,
           direction: LABEL_DIRECTION[index % 3],
           offset: [0, -6],
@@ -397,33 +535,78 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
         labels[index] = label;
       }
       lineGroup.addTo(lines);
-      linesRef.current.push({ id: route.id, group: lineGroup });
+      linesRef.current.push({ id: route.id, gray, casing, segments });
 
-      const markGroup = L.featureGroup();
-      route.checkpoints.forEach((point) => {
+      const markers = [];
+      route.checkpoints.forEach((point, pointIndex) => {
         const marker = L.circleMarker([point.lat, point.lng], {
           pane: "checks",
-          radius: 6,
-          color: "#fffdf8",
+          radius: 4,
+          color: surface,
           weight: 2,
-          fillColor: RISK_COLORS[point.level] || "#8a8a8a",
-          fillOpacity: 1,
+          fillColor: RISK_COLORS[point.level] || RISK_COLORS.Unassessed,
+          fillOpacity: 0,
+          opacity: 0,
         });
-        const detail = popupHtml(point);
-        marker.bindTooltip(detail, {
+        marker.bindTooltip(tipLine(point), {
           direction: "top",
           className: "checkpoint-tip",
           opacity: 1,
         });
-        marker.bindPopup(detail);
+        marker.bindPopup(popupHtml(point), { closeButton: false, autoPan: false });
+        marker.on("popupopen", () => {
+          const button = marker.getPopup()?.getElement()?.querySelector(".popup-close");
+          if (button) button.onclick = () => marker.closePopup();
+        });
+        marker.on("mouseover", () => marker.setRadius(6));
+        marker.on("mouseout", () => {
+          const hot = highlightRef.current
+            && highlightRef.current.routeId === route.id
+            && highlightRef.current.index === pointIndex;
+          marker.setRadius(hot ? 6 : 4);
+        });
         marker.on("click", () => onSelectRef.current?.(route.id));
-        markGroup.addLayer(marker);
+        marker.addTo(marks);
+        markers.push({ marker, index: pointIndex });
       });
-      markGroup.addTo(marks);
-      marksRef.current.push({ id: route.id, group: markGroup });
+      marksRef.current.push({ id: route.id, markers });
     });
-
     labelsRef.current = labels;
+
+    if (plan.origin) {
+      const marker = L.circleMarker([plan.origin.lat, plan.origin.lng], {
+        pane: "checks",
+        radius: 6,
+        color: text,
+        weight: 3,
+        fillColor: surface,
+        fillOpacity: 1,
+      });
+      marker.bindTooltip(esc(plan.origin.name), { direction: "top", className: "place-tip", opacity: 1 });
+      marker.addTo(marks);
+      bounds.push([plan.origin.lat, plan.origin.lng]);
+    }
+    if (plan.destination) {
+      L.circleMarker([plan.destination.lat, plan.destination.lng], {
+        pane: "checks",
+        radius: 8,
+        color: text,
+        weight: 1,
+        fillOpacity: 0,
+        interactive: false,
+      }).addTo(marks);
+      const marker = L.circleMarker([plan.destination.lat, plan.destination.lng], {
+        pane: "checks",
+        radius: 6,
+        color: surface,
+        weight: 3,
+        fillColor: text,
+        fillOpacity: 1,
+      });
+      marker.bindTooltip(esc(plan.destination.name), { direction: "top", className: "place-tip", opacity: 1 });
+      marker.addTo(marks);
+      bounds.push([plan.destination.lat, plan.destination.lng]);
+    }
 
     const onZoom = () => {
       const next = placeLabels(plan.routes, map);
@@ -475,29 +658,113 @@ export default function MapView({ plan, selected, hour, onSelect, showHeat = tru
   }, [showHeat, plan]);
 
   useEffect(() => {
-    const paint = (entry, on) => {
-      entry.group.eachLayer((layer) => {
-        if (!layer.setStyle || layer.options?.summary) return;
-        if (layer.setRadius && !layer.getLatLngs) {
-          layer.setRadius(on ? 7 : 4);
-          layer.setStyle({ opacity: on ? 1 : 0.45, fillOpacity: on ? 1 : 0.35 });
-        } else {
-          layer.setStyle({ weight: on ? 7 : 4, opacity: on ? 0.95 : 0.38 });
-        }
-        if (on && layer.bringToFront) layer.bringToFront();
+    linesRef.current.forEach((entry) => {
+      const on = entry.id === selected;
+      const shown = loading ? 0.4 : 1;
+      entry.gray.setStyle({ opacity: on ? 0 : (loading ? 0.4 : 0.9), weight: 3 });
+      entry.casing.setStyle({ opacity: on ? shown : 0 });
+      entry.gray.options.interactive = !on;
+      entry.segments.forEach((line) => {
+        line.options.interactive = on;
+        line.setStyle({ opacity: on ? shown : 0, weight: 5 });
+        if (line._path) line._path.style.pointerEvents = on ? "auto" : "none";
       });
-    };
-    linesRef.current.forEach((entry) => paint(entry, entry.id === selected));
-    marksRef.current.forEach((entry) => paint(entry, entry.id === selected));
+      if (entry.gray._path) entry.gray._path.style.pointerEvents = on ? "none" : "auto";
+      if (on) {
+        entry.casing.bringToFront();
+        entry.segments.forEach((line) => line.bringToFront());
+      } else if (entry.gray.bringToBack) {
+        entry.gray.bringToBack();
+      }
+    });
+    marksRef.current.forEach((entry) => {
+      const on = entry.id === selected;
+      entry.markers.forEach(({ marker, index }) => {
+        const hot = highlightCheckpoint
+          && highlightCheckpoint.routeId === entry.id
+          && highlightCheckpoint.index === index;
+        const shown = on ? (loading ? 0.4 : 1) : 0;
+        marker.options.interactive = on;
+        if (!on && marker.isPopupOpen?.()) marker.closePopup();
+        marker.setStyle({ opacity: shown, fillOpacity: shown });
+        marker.setRadius(on && hot ? 6 : 4);
+        if (marker._path) marker._path.style.pointerEvents = on ? "auto" : "none";
+      });
+    });
     labelsRef.current.forEach((label) => {
+      if (!label) return;
       const tip = label.getTooltip();
       if (!tip) return;
       const on = label.options.routeId === selected;
       const el = tip.getElement();
-      if (el) el.classList.toggle("selected", on);
+      if (el) {
+        el.classList.toggle("selected", on);
+        el.style.opacity = loading ? "0.4" : "1";
+      }
       if (on) tip.bringToFront();
     });
-  }, [plan, selected]);
+  }, [plan, selected, loading, highlightCheckpoint]);
 
-  return <div ref={node} className="map" />;
+  useEffect(() => {
+    if (!focusCheckpoint || !mapRef.current) return;
+    const entry = marksRef.current.find((item) => item.id === focusCheckpoint.routeId);
+    const found = entry?.markers.find((item) => item.index === focusCheckpoint.index);
+    if (!found) return;
+    mapRef.current.panTo(found.marker.getLatLng());
+    found.marker.openPopup();
+  }, [focusCheckpoint]);
+
+  return (
+    <div className="map-wrap">
+      {loading && <div className="load-bar" aria-hidden="true" />}
+      <div ref={node} className="map" aria-label="Route map" />
+      <div className="map-zoom">
+        <IconButton label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </IconButton>
+        <IconButton label="Zoom out" onClick={() => mapRef.current?.zoomOut()}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M3.5 8h9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+        </IconButton>
+      </div>
+      <div className="map-layers" ref={layerBoxRef}>
+        <button
+          type="button"
+          className="layer-btn"
+          aria-label="Map layers"
+          aria-expanded={menu}
+          onClick={() => setMenu((open) => !open)}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M8 2.5 13.5 5.25 8 8 2.5 5.25 8 2.5zM2.5 8 8 10.75 13.5 8M2.5 10.75 8 13.5 13.5 10.75" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+          </svg>
+        </button>
+        {menu && (
+          <div className="layer-menu" role="radiogroup" aria-label="Base map">
+            <label>
+              <input
+                type="radio"
+                name="basemap"
+                checked={base === "map"}
+                onChange={() => setBase("map")}
+              />
+              Map
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="basemap"
+                checked={base === "satellite"}
+                onChange={() => setBase("satellite")}
+              />
+              Satellite
+            </label>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
