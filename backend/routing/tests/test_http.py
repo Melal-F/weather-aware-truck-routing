@@ -9,10 +9,12 @@ import requests
 
 from routing.geo import cumulative_miles, haversine_miles, place_checkpoints
 from routing.services import (
+    ALTERNATIVES_MAX_KM,
     KM_PER_MILE,
     TARE_LB,
     LB_TO_TONNES,
     ORS_MAX_WEIGHT_TONNES,
+    _trip_km,
     build_plan,
     open_meteo,
     ors_routes,
@@ -50,7 +52,17 @@ def _hours():
     return times
 
 
-class ViaFallbackTest(unittest.TestCase):
+class FreshCacheTest(unittest.TestCase):
+    """ors_routes caches results; every test starts from an empty cache."""
+
+    def setUp(self):
+        super().setUp()
+        from django.core.cache import cache
+
+        cache.clear()
+
+
+class ViaFallbackTest(FreshCacheTest):
     @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
     @patch("routing.services.requests.post")
     def test_long_trip_adds_via_routes_until_three(self, post):
@@ -116,7 +128,7 @@ def _via_path(via=None):
     return path
 
 
-class ConcurrentViaTest(unittest.TestCase):
+class ConcurrentViaTest(FreshCacheTest):
     @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
     @patch("routing.services.requests.post")
     def test_via_requests_overlap_and_keep_via_order(self, post):
@@ -315,16 +327,14 @@ class RecommendationReasonTest(unittest.TestCase):
         )
         winner = next(route for route in plan["routes"] if route["recommended"])
         self.assertEqual(winner["id"], 1)
-        self.assertRegex(
-            winner["recommendation_reason"],
-            r"^Fewest No Travel miles: 0\.0 vs [0-9]+\.[0-9] mi$",
-        )
-        shown = float(winner["recommendation_reason"].split(" vs ")[1].split(" ")[0])
-        self.assertAlmostEqual(shown, plan["routes"][0]["miles"]["No Travel"], delta=0.05)
+        self.assertEqual(winner["recommendation_reason"], "Only safe route.")
+        self.assertGreater(plan["routes"][0]["miles"]["No Travel"], 0)
+        self.assertFalse(plan["routes"][0]["recommended"])
         self.assertIsNone(plan["routes"][0]["recommendation_reason"])
+        self.assertEqual(plan["safety_note"], None)
 
 
-class ViaOffsetTest(unittest.TestCase):
+class ViaOffsetTest(FreshCacheTest):
     def _km_from_midpoint(self, origin, destination):
         points = via_points(origin, destination)
         mid = (
@@ -487,5 +497,109 @@ class ShowerRainTest(unittest.TestCase):
         self.assertEqual(open_meteo(point, start, end)[0]["rain"], [])
 
 
+class ShortTripProfileTest(FreshCacheTest):
+    def _places(self):
+        origin = {"name": "A", "lat": 41.88, "lng": -87.63}
+        destination = {"name": "B", "lat": 41.96, "lng": -87.63}
+        self.assertLessEqual(_trip_km(origin, destination), ALTERNATIVES_MAX_KM)
+        return origin, destination
+
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_alternatives_400_retries_the_same_profile(self, post):
+        origin, destination = self._places()
+        line = [[-87.63, 41.88], [-87.63, 41.92], [-87.63, 41.96]]
+        seen = []
+
+        def post_json(url, json=None, headers=None, timeout=None):
+            body = json or {}
+            seen.append((url, body, headers, timeout))
+            if "alternative_routes" in body:
+                return _response(400, {"error": {"message": "no"}})
+            return _response(200, {"features": [_feature(line, 900)]})
+
+        post.side_effect = post_json
+        routes = ors_routes(origin, destination, load_lb=42000)
+        self.assertEqual([route["profile"] for route in routes], ["driving-hgv"])
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all("/driving-hgv/" in url for url, *_rest in seen))
+        self.assertIn("alternative_routes", seen[0][1])
+        self.assertNotIn("alternative_routes", seen[1][1])
+        self.assertEqual(seen[0][1]["radiuses"], [-1, -1])
+        self.assertEqual(seen[0][2]["Authorization"], "test-key")
+        self.assertEqual(seen[0][3], (5, 20))
+        self.assertIn("weight", seen[1][1]["options"]["profile_params"]["restrictions"])
+
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_car_fallback_only_after_hgv_refuses_without_alternatives(self, post):
+        origin, destination = self._places()
+        line = [[-87.63, 41.88], [-87.63, 41.92], [-87.63, 41.96]]
+        seen = []
+
+        def post_json(url, json=None, headers=None, timeout=None):
+            body = json or {}
+            seen.append((url, body, headers))
+            if "/driving-hgv/" in url:
+                return _response(400, {"error": {"message": "no"}})
+            self.assertNotIn("options", body)
+            return _response(200, {"features": [_feature(line, 900)]})
+
+        post.side_effect = post_json
+        routes = ors_routes(origin, destination, load_lb=42000)
+        self.assertEqual(routes[0]["profile"], "driving-car")
+        hgv = [item for item in seen if "/driving-hgv/" in item[0]]
+        car = [item for item in seen if "/driving-car/" in item[0]]
+        self.assertEqual(len(hgv), 2)
+        self.assertEqual(len(car), 1)
+        self.assertIn("alternative_routes", hgv[0][1])
+        self.assertNotIn("alternative_routes", hgv[1][1])
+        self.assertNotIn("options", car[0][1])
+        self.assertEqual(car[0][2]["Authorization"], "test-key")
+
+
+class DetourLimitTest(FreshCacheTest):
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_via_at_1_6_is_kept_and_a_slower_via_is_dropped(self, post):
+        self.assertGreater(_trip_km(_NORTH, _SOUTH), ALTERNATIVES_MAX_KM)
+        vias = via_points(_NORTH, _SOUTH)
+        kept_via = vias[0]
+
+        def post_json(url, json=None, headers=None, timeout=None):
+            body = json or {}
+            coords = body["coordinates"]
+            self.assertNotIn("alternative_routes", body)
+            line, _route_coords, _duration = _shifted_line(coords)
+            duration = 1000.0
+            if len(coords) == 3:
+                duration = 1600.0 if _is_via(coords, kept_via) else 2000.0
+            return _response(200, {"features": [_feature(line, duration)]})
+
+        post.side_effect = post_json
+        routes = ors_routes(_NORTH, _SOUTH, load_lb=42000)
+        durations = sorted(route["duration_seconds"] for route in routes)
+        self.assertEqual(durations, [1000.0, 1600.0])
+        self.assertTrue(all(route["profile"] == "driving-hgv" for route in routes))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class RouteCacheTest(FreshCacheTest):
+    @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
+    @patch("routing.services.requests.post")
+    def test_same_trip_and_weight_reuse_routes_other_weight_does_not(self, post):
+        origin = {"name": "A", "lat": 41.88, "lng": -87.63}
+        destination = {"name": "B", "lat": 41.96, "lng": -87.63}
+        line = [[-87.63, 41.88], [-87.63, 41.92], [-87.63, 41.96]]
+        post.return_value = _response(200, {"features": [_feature(line, 900)]})
+
+        first = ors_routes(origin, destination, load_lb=42000)
+        calls = post.call_count
+        self.assertGreater(calls, 0)
+        self.assertEqual(ors_routes(origin, destination, load_lb=42000), first)
+        self.assertEqual(post.call_count, calls)
+        ors_routes(origin, destination, load_lb=80000)
+        self.assertGreater(post.call_count, calls)

@@ -25,13 +25,25 @@ export function formatDrive(seconds) {
   return `${hours} h ${minutes} m`;
 }
 
+const formatters = new Map();
+
+export function dateFormatter(locale, options) {
+  const key = `${locale ?? ""}\0${JSON.stringify(options)}`;
+  let cached = formatters.get(key);
+  if (!cached) {
+    cached = new Intl.DateTimeFormat(locale, options);
+    formatters.set(key, cached);
+  }
+  return cached;
+}
+
 function zoned(iso, tz, options) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
   const format = { ...options };
   if (tz) format.timeZone = tz;
   else delete format.timeZoneName;
-  return new Intl.DateTimeFormat(undefined, format).format(date);
+  return dateFormatter(undefined, format).format(date);
 }
 
 export function formatClock(iso, tz) {
@@ -71,7 +83,7 @@ export function formatTripStamp(iso, tz) {
 export function dayKey(iso, tz) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
-  const parts = new Intl.DateTimeFormat("en-US", {
+  const parts = dateFormatter("en-US", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -92,7 +104,7 @@ export function formatWhen(iso) {
   if (!iso) return "—";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
+  return dateFormatter(undefined, {
     weekday: "short",
     month: "short",
     day: "numeric",
@@ -125,6 +137,12 @@ async function read(response) {
     throw new Error(body.error || `Request failed (${response.status}).`);
   }
   return body;
+}
+
+export async function fetchTimezone(lat, lng) {
+  const response = await fetch(`/api/timezone?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`);
+  const body = await read(response);
+  return body.tz;
 }
 
 export async function geocode(query) {

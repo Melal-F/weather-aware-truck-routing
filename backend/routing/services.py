@@ -37,6 +37,8 @@ FORECAST_HOURS = 49
 DEPARTURE_MAX_DAYS = 13
 WEATHER_CHUNK = 100
 WEATHER_CACHE_SECONDS = 1800
+# Roads do not change within the hour; the same trip re-plans without ORS.
+ROUTE_CACHE_SECONDS = 3600
 MAX_WEATHER_LOCATIONS = 350
 logger = logging.getLogger(__name__)
 # GET retries live on the adapter. POST shares the session and timeouts only.
@@ -166,7 +168,7 @@ def location_timezone(lat, lng):
     name = _zone_name(payload) if response.status_code < 400 else None
     if not name:
         raise PlanError("The weather service returned an unexpected forecast.", status=502)
-    cache.set(key, name, WEATHER_CACHE_SECONDS)
+    cache.set(key, name, 86400)
     return name
 
 
@@ -221,24 +223,39 @@ def hour_index(row, moment):
     return i if 0 <= i < len(row["time"]) else None
 
 
+def _series_value(hourly, name, index):
+    times = hourly.get("time") or []
+    values = hourly.get(name) or []
+    if index < 0 or index >= len(times) or index >= len(values):
+        return None
+    value = values[index]
+    if value is None:
+        return None
+    return float(value)
+
+
 def reading_at(hourly, moment):
+    """Wind at the ETA hour. Rain, showers and snow come from the next stamp.
+
+    Open-Meteo sums precipitation over the preceding hour, so the value
+    stamped 05:00 fell from 04:00 to 05:00. Wind is the reading at that hour.
+    """
     index = hour_index(hourly, moment)
     if index is None:
         raise PlanError(
             "The forecast does not cover that trip. Pick a departure within 13 days.",
             status=502,
         )
-
-    def cell(name):
-        values = hourly.get(name) or []
-        if index >= len(values):
-            return None
-        value = values[index]
-        if value is None:
-            return None
-        return float(value)
-
-    return cell("wind_speed_10m"), mm_to_inches(cell("rain")), cm_to_inches(cell("snowfall"))
+    wind = _series_value(hourly, "wind_speed_10m", index)
+    # The stamp at i + 1 is the hour that ends then, which is the ETA's hour.
+    precip = index + 1
+    rain = _series_value(hourly, "rain", precip)
+    showers = _series_value(hourly, "showers", precip)
+    if rain is None and showers is None:
+        rain_in = None
+    else:
+        rain_in = mm_to_inches((rain or 0) + (showers or 0))
+    return wind, rain_in, cm_to_inches(_series_value(hourly, "snowfall", precip))
 
 
 def _step_spans(properties):
@@ -416,6 +433,43 @@ def _direct_routes(profile, coordinates, load_lb, key, alternatives):
     return routes, status
 
 
+def _fetch_routes(profile, origin, destination, load_lb, key, long_trip):
+    """Direct route, plus the via routes of a long trip, all requested at once."""
+    direct = [
+        [origin["lng"], origin["lat"]],
+        [destination["lng"], destination["lat"]],
+    ]
+    weight = load_lb if profile == "driving-hgv" else None
+    if not long_trip:
+        routes, status = _direct_routes(profile, direct, weight, key, alternatives=True)
+        return routes, status, []
+    paths = [[direct[0], [via["lng"], via["lat"]], direct[1]] for via in via_points(origin, destination)]
+
+    def fetch_via(path):
+        try:
+            extra, extra_status = _ors_call(profile, path, weight, key, False)
+        except (PlanError, requests.RequestException):
+            return None
+        if extra_status != "ok" or not extra:
+            return None
+        return extra[0]
+
+    with ThreadPoolExecutor(max_workers=len(paths) + 1) as pool:
+        direct_future = pool.submit(_direct_routes, profile, direct, weight, key, False)
+        via_futures = [pool.submit(fetch_via, path) for path in paths]
+        routes, status = direct_future.result()
+        candidates = [future.result() for future in via_futures]
+    return routes, status, candidates
+
+
+def _routes_cache_key(origin, destination, load_lb):
+    tonnes = weight_tonnes(load_lb) if load_lb else 0
+    return (
+        f"ors:{origin['lat']:.4f}:{origin['lng']:.4f}:"
+        f"{destination['lat']:.4f}:{destination['lng']:.4f}:{tonnes:.1f}"
+    )
+
+
 def ors_routes(origin, destination, load_lb=None):
     key = os.environ.get("ORS_API_KEY", "").strip()
     if not key:
@@ -423,47 +477,23 @@ def ors_routes(origin, destination, load_lb=None):
             "ORS_API_KEY is not set. Add a free OpenRouteService key and restart.",
             status=500,
         )
-    trip_km = _trip_km(origin, destination)
-    long_trip = trip_km > ALTERNATIVES_MAX_KM
-    direct = [
-        [origin["lng"], origin["lat"]],
-        [destination["lng"], destination["lat"]],
-    ]
+    cache_key = _routes_cache_key(origin, destination, load_lb)
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+    long_trip = _trip_km(origin, destination) > ALTERNATIVES_MAX_KM
     profile = "driving-hgv"
-    routes, status = _direct_routes(profile, direct, load_lb, key, alternatives=not long_trip)
+    routes, status, candidates = _fetch_routes(profile, origin, destination, load_lb, key, long_trip)
     # Car only when HGV itself was refused on a body that did not ask for alternatives.
     if status == "refused" or (not routes and not long_trip):
         profile = "driving-car"
-        routes, status = _direct_routes(profile, direct, None, key, alternatives=not long_trip)
+        routes, status, candidates = _fetch_routes(profile, origin, destination, None, key, long_trip)
         if status == "refused" or (not routes and not long_trip):
             raise PlanError("The routing service rejected the request.", status=502)
     kept = []
     for route in routes or []:
         _keep_distinct(kept, route)
     if long_trip and len(kept) < 3:
-        paths = [
-            [
-                [origin["lng"], origin["lat"]],
-                [via["lng"], via["lat"]],
-                [destination["lng"], destination["lat"]],
-            ]
-            for via in via_points(origin, destination)
-        ]
-
-        def fetch_via(path):
-            try:
-                extra, extra_status = _ors_call(profile, path, load_lb, key, False)
-            except (PlanError, requests.RequestException):
-                return None
-            if extra_status != "ok" or not extra:
-                return None
-            return extra[0]
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(fetch_via, path): index for index, path in enumerate(paths)}
-            candidates = [None] * len(paths)
-            for future, index in futures.items():
-                candidates[index] = future.result()
         for candidate in candidates:
             if len(kept) >= 3:
                 break
@@ -481,6 +511,7 @@ def ors_routes(origin, destination, load_lb=None):
     for route in kept:
         route.pop("via", None)
         route["profile"] = profile
+    cache.set(cache_key, kept[:3], ROUTE_CACHE_SECONDS)
     return kept[:3]
 
 
@@ -501,7 +532,7 @@ def ors_autocomplete(query):
     response = session.get(
         "https://api.openrouteservice.org/geocode/autocomplete",
         params={"api_key": key, "text": text},
-        timeout=10,
+        timeout=(5, 20),
     )
     if response.status_code in (401, 403):
         raise PlanError("OpenRouteService rejected the API key.", status=502)
@@ -698,24 +729,31 @@ def build_plan(payload, fetch_routes, fetch_weather):
     origin = parse_place(payload.get("origin"), "Origin")
     destination = parse_place(payload.get("destination"), "Destination")
     raw_departure = payload.get("departure")
-    zone = None
+    naive = False
     if isinstance(raw_departure, str):
         text = raw_departure.strip()
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
-            probe = datetime.fromisoformat(text)
+            naive = datetime.fromisoformat(text).tzinfo is None
         except ValueError:
-            probe = None
-        if probe is not None and probe.tzinfo is None:
-            zone = location_timezone(origin["lat"], origin["lng"])
-    departure = parse_departure(raw_departure, zone=zone)
+            naive = False
+    if not naive:
+        departure = parse_departure(raw_departure)
     load_lb = parse_load(payload.get("load_lb"))
     spacing = parse_spacing(payload.get("spacing_miles"))
     if abs(origin["lat"] - destination["lat"]) < 1e-5 and abs(origin["lng"] - destination["lng"]) < 1e-5:
         raise PlanError("Origin and destination are the same place.")
 
-    raw_routes = fetch_routes(origin, destination, load_lb) or []
+    if naive:
+        # The origin's zone and the roads don't depend on each other: fetch both at once.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            zone_future = pool.submit(location_timezone, origin["lat"], origin["lng"])
+            raw_routes = fetch_routes(origin, destination, load_lb) or []
+            zone = zone_future.result()
+        departure = parse_departure(raw_departure, zone=zone)
+    else:
+        raw_routes = fetch_routes(origin, destination, load_lb) or []
     drafts = []
     for raw in raw_routes[:3]:
         coords = raw.get("coords") or []
@@ -853,9 +891,10 @@ def build_plan(payload, fetch_routes, fetch_weather):
         "load_lb": load_lb,
         "spacing_miles": spacing,
         "corridor_cell_deg": corridor_deg,
-        "origin": _public_place(origin),
-        "destination": _public_place(destination),
+        "origin": _public_place(origin, _tz_at(by_key, origin)),
+        "destination": _public_place(destination, _tz_at(by_key, destination)),
         "note": _route_note(len(routes)),
+        "safety_note": None if any(route["recommended"] for route in routes) else reason,
         "routes": [_public_route(route) for route in routes],
         "corridor": corridor_out,
     }

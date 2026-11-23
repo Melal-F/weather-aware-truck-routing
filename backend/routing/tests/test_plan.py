@@ -240,6 +240,16 @@ class BuildPlanTest(unittest.TestCase):
         self.assertAlmostEqual(point["rain_in_hr"], 1.0, places=3)
         self.assertEqual(point["rain_level"], "Severe")
 
+    def test_snow_conversion_uses_inches(self):
+        plan = build_plan(
+            payload(load_lb=1000),
+            two_routes,
+            weather_factory(lambda _lat: 0.0, snow_cm=2.54),
+        )
+        point = plan["routes"][0]["checkpoints"][0]
+        self.assertAlmostEqual(point["snow_in_hr"], 1.0, places=3)
+        self.assertEqual(point["snow_level"], "High")
+
     def test_tighter_spacing_adds_checkpoints(self):
         wide = build_plan(payload(spacing_miles=50), two_routes, weather_factory(lambda _lat: 5.0))
         tight = build_plan(payload(spacing_miles=10), two_routes, weather_factory(lambda _lat: 5.0))

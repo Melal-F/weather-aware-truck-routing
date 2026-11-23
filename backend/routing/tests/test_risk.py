@@ -165,6 +165,19 @@ class MilesAndAverageTest(unittest.TestCase):
     def test_no_scored_miles(self):
         self.assertIsNone(average_risk({name: 0.0 for name in RANK}))
 
+    def test_both_missing_levels_are_unassessed(self):
+        checkpoints = [
+            {"mile": 0, "level": None},
+            {"mile": 10, "level": None},
+            {"mile": 25, "level": "High"},
+        ]
+        miles = miles_by_level(checkpoints)
+        self.assertAlmostEqual(miles["High"], 15)
+        self.assertAlmostEqual(miles["Unassessed"], 10)
+        self.assertAlmostEqual(miles["Low"], 0)
+        self.assertAlmostEqual(sum(miles.values()), 25)
+        self.assertAlmostEqual(average_risk(miles), RANK["High"])
+
 
 class RankRoutesTest(unittest.TestCase):
     def _assert_reason_names_the_ranked_winner(self, routes):
@@ -228,6 +241,10 @@ class RankRoutesTest(unittest.TestCase):
         rank_routes(tied)
         self.assertTrue(first["recommended"])
         self.assertFalse(second["recommended"])
+        self.assertEqual(
+            recommendation_reason(tied),
+            "Tied on risk and time; kept the first route the routing service returned.",
+        )
 
     def test_unscored_route_does_not_beat_a_scored_one(self):
         blank = route(0, 0, 0, None, 10)
@@ -282,12 +299,54 @@ class RankRoutesTest(unittest.TestCase):
         )
         self._assert_reason_names_the_ranked_winner(routes)
 
-    def test_only_route_returned(self):
-        routes = [route(1, 2, 3, 4, 5)]
+    def test_a_faster_route_that_lost_is_named(self):
+        fast = route(0, 20, 0, 3, 4 * 3600 + 53 * 60, low=80)
+        slow = route(0, 0, 0, 1, 6 * 3600, low=80)
+        routes = [fast, slow]
         rank_routes(routes)
+        self.assertTrue(routes[1]["recommended"])
+        self.assertEqual(
+            recommendation_reason(routes),
+            "Avoids 20 mi of Severe on Route A (4 h 53 m)",
+        )
+
+        quicker = route(0, 0, 0, 1.11, 3 * 3600, low=10)
+        calmer = route(0, 0, 0, 1.0, 5 * 3600, low=10)
+        pair = [quicker, calmer]
+        rank_routes(pair)
+        self.assertEqual(
+            recommendation_reason(pair),
+            "Lower average risk than Route A: 1.00 vs 1.11",
+        )
+
+    def test_only_route_returned(self):
+        routes = [route(0, 2, 3, 4, 5, low=1)]
+        rank_routes(routes)
+        self.assertTrue(routes[0]["recommended"])
         self.assertEqual(recommendation_reason(routes), "Only route returned.")
         self._assert_reason_names_the_ranked_winner(routes)
         self.assertIsNone(recommendation_reason([]))
+
+    def test_no_travel_and_unassessed_routes_are_not_recommended(self):
+        clear = route(0, 8, 0, 3, 5 * 3600, low=10)
+        blocked = route(4, 0, 0, 5, 3 * 3600, low=10)
+        incomplete = route(0, 0, 0, None, 2 * 3600, low=0)
+        incomplete["miles"]["Unassessed"] = 40
+        routes = [blocked, clear, incomplete]
+        rank_routes(routes)
+        self.assertEqual([item["recommended"] for item in routes], [False, True, False])
+        self.assertEqual(recommendation_reason(routes), "Only safe route.")
+
+        blocked_only = [route(3, 0, 0, 5, 100), route(1, 9, 0, 4, 200)]
+        rank_routes(blocked_only)
+        self.assertEqual([item["recommended"] for item in blocked_only], [False, False])
+        self.assertEqual(recommendation_reason(blocked_only), "No safe route is available.")
+
+        missing = [route(0, 0, 0, None, 100)]
+        missing[0]["miles"]["Unassessed"] = 80
+        rank_routes(missing)
+        self.assertFalse(missing[0]["recommended"])
+        self.assertEqual(recommendation_reason(missing), "No safe route is available.")
 
 
 class UnitConversionTest(unittest.TestCase):

@@ -78,24 +78,23 @@ Load changes wind only, and it is applied before the worst-of step:
 
 Rain and snow do not use the load cutoffs.
 
-Miles of a level are the path miles from a checkpoint to the next one, tagged with the worse of the two checkpoints that bound it, so a hazard at either end counts.
+Miles of a level are the path miles from a checkpoint to the next one, tagged with the worse of the two checkpoints that bound it, so a hazard at either end counts. A stretch whose endpoints both have no reading is Unassessed, not Low. Low + Moderate + High + Severe + No Travel + Unassessed equals the route distance.
 
-Average risk is the distance-weighted mean of Low = 1, Moderate = 2, High = 3, Severe = 4, No Travel = 5.
+Average risk is the distance-weighted mean of the assessed miles only: Low = 1, Moderate = 2, High = 3, Severe = 4, No Travel = 5. The dispatch brief does not assign these numbers. Unassessed miles are left out of the average.
 
 ## Which route is recommended
 
-Best first:
+A route with any No Travel miles or any Unassessed miles is not a safe option and is left out of the ranking. The card says “Not a safe route.” If every route is ineligible, the panel says “No safe route is available.” and no route is marked recommended.
 
-1. Fewest No Travel miles
-2. Fewest Severe miles
-3. Fewest High miles
-4. Lowest average risk
-5. Shortest travel time
-6. The order the routing service returned, if still tied
+Eligible routes, best first:
 
-No Travel is sorted first so an impassable route cannot beat a route that is only severe. The brief’s four keys follow that, in the same order.
+1. Fewest Severe miles
+2. Fewest High miles
+3. Lowest average risk
+4. Shortest travel time
+5. The order the routing service returned, if still tied
 
-The recommended card states the first of those keys that actually separated the winner, with the winner’s number against the runner-up, for example “Fewest Severe miles: 0.0 vs 12.4 mi” or “Shortest travel time: 6 h 10 min vs 6 h 45 min.” A full tie keeps the first route the service returned.
+The recommended card states the first of those keys that actually separated the winner, with the winner’s number against the next eligible route, for example “Fewest Severe miles: 0.0 vs 12.4 mi” or “Shortest travel time: 6 h 10 min vs 6 h 45 min.” A full tie keeps the first eligible route the service returned. One eligible route among unsafe ones says “Only safe route.”
 
 ## Units
 
@@ -105,7 +104,7 @@ The page and the API stay in miles, mph, inches per hour, and pounds. Open-Meteo
 
 All routes are drawn at once, split into runs of one risk color. Each route keeps a summary label on the map (distance, travel time, Severe and High miles, average risk). Checkpoints are dots. Hovering a checkpoint shows the mile, the ETA, the combined risk, and the wind, rain, and snow readings. A click opens the same detail and selects that route. The panel lists distance, travel time, arrival, miles in each level, average risk, and a Recommended badge with the reason under it.
 
-The corridor is a band, not a single line. For each sample along a route the forecast also covers points 10 and 20 miles to either side, perpendicular to the local heading. Samples are taken every 12 miles, ignoring slider spacing, and snapped to a 0.2° grid. Weather lookups for checkpoints and the corridor snap to 0.1° (about 11 km) and share one forecast per cell. A plan requests at most 350 unique locations; checkpoint cells are kept and corridor cells are thinned to fit. Forecasts are cached for 30 minutes, and Open-Meteo is still requested in batches of 100. On the map the band is radial gradients about 16 km across, wider in pixels as you zoom in, drawn from lower risk to higher so the worst level sits on top. Dragging the map only moves the existing canvas. The current hour is redrawn once the pan or zoom settles, or when the slider or Play changes the hour. Up to six hours already drawn for that view are kept and dropped when the view changes. Hide corridor turns the band off. None of that calls the network again, and checkpoint risk stays tied to arrival time. Hour 0 is the departure hour. Hour 48 is 48 hours later.
+The corridor is a band, not a single line. Samples are taken every 6 miles along each route, ignoring checkpoint spacing. Each sample considers the 5×5 block of grid cells around it and keeps a cell whose center is within 22 miles. Cells are deduped. The grid starts at 0.2°. If unique weather keys would pass 350, the walk retries at 0.25° and then 0.3°, and only then thins corridor cells. Checkpoint cells are never dropped. The response field `corridor_cell_deg` is the size used, and each corridor item is that cell's center with 49 hourly risks. Weather lookups for checkpoints and the corridor snap to 0.1° (about 11 km) and share one forecast per cell. Forecasts are cached for 30 minutes, and Open-Meteo is still requested in batches of 100. On the map each cell is a rectangle at alpha 0.45, blurred by the smaller of 24 pixels and 0.35 times the cell width in pixels, wider in pixels as you zoom in, drawn from lower risk to higher so the worst level sits on top. Dragging the map only moves the existing canvas. The current hour is redrawn once the pan or zoom settles, or when the slider or Play changes the hour. Up to six hours already drawn for that view are kept and dropped when the view changes. Hide corridor turns the band off. None of that calls the network again, and checkpoint risk stays tied to arrival time. Hour 0 is the departure hour. Hour 48 is 48 hours later.
 
 Colors: Low green, Moderate yellow, High orange, Severe red, No Travel black.
 
@@ -131,6 +130,5 @@ Connect the repo in the Render dashboard. Render picks up `render.yaml` and crea
 
 ## Known limits
 
-Open-Meteo free tier allows 600 locations per minute; corridor cells grow from 0.2° to 0.3° on long trips so a plan stays within 350 weather locations.
+Open-Meteo free tier allows 600 locations per minute; corridor cells grow from 0.2° to 0.3° on long trips so a plan stays within 350 weather locations. Departure must be between one hour ago and 13 days ahead (the plan returns 400 outside that window). If the forecast does not cover the trip, the plan returns 502.
 
-The walkthrough script is in [LOOM.md](LOOM.md).

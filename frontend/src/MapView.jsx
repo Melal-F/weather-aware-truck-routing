@@ -19,11 +19,6 @@ const HeatLayer = L.Layer.extend({
     this._cellDeg = cell > 0 ? cell : 0.2;
     this._hour = 0;
     this._enabled = true;
-    this._hourCache = new Map();
-    this._cacheView = "";
-    this._cacheCellPx = null;
-    this._cacheBlur = null;
-    this._cachePad = null;
     this._origin = null;
   },
 
@@ -57,7 +52,6 @@ const HeatLayer = L.Layer.extend({
     map.off("moveend zoomend resize", this._onSettle, this);
     if (this._frame) cancelAnimationFrame(this._frame);
     this._canvas.remove();
-    this._hourCache.clear();
     this._map = null;
   },
 
@@ -67,13 +61,6 @@ const HeatLayer = L.Layer.extend({
       this._frame = 0;
       this._paint();
     });
-  },
-
-  _viewKey() {
-    const map = this._map;
-    const center = map.getCenter();
-    const size = map.getSize();
-    return `${map.getZoom().toFixed(2)}:${center.lat.toFixed(3)}:${center.lng.toFixed(3)}:${size.x}x${size.y}`;
   },
 
   _cellPx() {
@@ -112,18 +99,6 @@ const HeatLayer = L.Layer.extend({
     }
   },
 
-  _remember(hour, source) {
-    if (this._hourCache.has(hour)) this._hourCache.delete(hour);
-    if (this._hourCache.size >= 6) {
-      this._hourCache.delete(this._hourCache.keys().next().value);
-    }
-    const copy = document.createElement("canvas");
-    copy.width = source.width;
-    copy.height = source.height;
-    copy.getContext("2d").drawImage(source, 0, 0);
-    this._hourCache.set(hour, copy);
-  },
-
   _paint() {
     const map = this._map;
     const canvas = this._canvas;
@@ -135,37 +110,24 @@ const HeatLayer = L.Layer.extend({
     const pad = 2 * blur;
     const cssW = size.x + pad * 2;
     const cssH = size.y + pad * 2;
-    canvas.width = Math.max(1, cssW) * ratio;
-    canvas.height = Math.max(1, cssH) * ratio;
+    const pxW = Math.max(1, Math.round(cssW * ratio));
+    const pxH = Math.max(1, Math.round(cssH * ratio));
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
     canvas.style.width = `${cssW}px`;
     canvas.style.height = `${cssH}px`;
     canvas.style.filter = `blur(${blur}px)`;
     this._origin = map.containerPointToLayerPoint([-pad, -pad]);
     L.DomUtil.setPosition(canvas, this._origin);
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!this._enabled) return;
-    const view = this._viewKey();
-    if (
-      view !== this._cacheView ||
-      cellPx !== this._cacheCellPx ||
-      blur !== this._cacheBlur ||
-      pad !== this._cachePad
-    ) {
-      this._hourCache.clear();
-      this._cacheView = view;
-      this._cacheCellPx = cellPx;
-      this._cacheBlur = blur;
-      this._cachePad = pad;
-    }
-    const frame = this._hourCache.get(this._hour);
-    if (frame && frame.width === canvas.width && frame.height === canvas.height) {
-      ctx.drawImage(frame, 0, 0);
+    if (!this._enabled) {
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       return;
     }
-    this._drawHour(ctx, ratio, this._hour, pad);
-    this._remember(this._hour, canvas);
+    this._drawHour(canvas.getContext("2d"), ratio, this._hour, pad);
   },
 });
 
@@ -383,11 +345,26 @@ export default function MapView({
       zoomControl: false,
       fadeAnimation: false,
     });
-    const streets = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
-      subdomains: "abcd",
-      maxZoom: 19,
-      attribution: "© OpenStreetMap contributors © CARTO",
-    });
+    map.createPane("labels");
+    map.getPane("labels").style.zIndex = 350;
+    map.getPane("labels").style.pointerEvents = "none";
+    // CARTO raster tiles now require an API key and otherwise draw an
+    // "API KEY REQUIRED" placeholder. Esri's light gray canvas is the same
+    // kind of neutral basemap and needs no key.
+    const streets = L.layerGroup([
+      L.tileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        {
+          maxZoom: 19,
+          maxNativeZoom: 16,
+          attribution: "Tiles © Esri — Esri, DeLorme, NAVTEQ",
+        },
+      ),
+      L.tileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+        { maxZoom: 19, maxNativeZoom: 16, pane: "labels" },
+      ),
+    ]);
     const satellite = L.tileLayer(
       "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
       {
@@ -396,9 +373,6 @@ export default function MapView({
           "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
       },
     );
-    map.createPane("labels");
-    map.getPane("labels").style.zIndex = 350;
-    map.getPane("labels").style.pointerEvents = "none";
     const placeNames = L.tileLayer(
       "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
       { maxZoom: 19, pane: "labels" },
@@ -429,10 +403,13 @@ export default function MapView({
       map.invalidateSize();
     };
     window.addEventListener("resize", onResize);
+    const observer = new ResizeObserver(onResize);
+    if (node.current) observer.observe(node.current);
     frame = requestAnimationFrame(onResize);
     return () => {
       cancelAnimationFrame(frame);
       mapRef.current = null;
+      observer.disconnect();
       window.removeEventListener("resize", onResize);
       map.remove();
       layersRef.current = null;
@@ -749,7 +726,7 @@ export default function MapView({
         <button
           type="button"
           className="layer-btn"
-          aria-label="Map layers"
+          aria-label={base === "satellite" ? "Basemap, Satellite" : "Basemap, Streets"}
           aria-expanded={menu}
           onClick={() => setMenu((open) => !open)}
         >
@@ -766,7 +743,7 @@ export default function MapView({
                 checked={base === "map"}
                 onChange={() => setBase("map")}
               />
-              Map
+              Streets
             </label>
             <label>
               <input

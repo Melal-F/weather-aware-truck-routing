@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY backend/ /app
 COPY --from=frontend /src/dist /app/frontend_dist
 EXPOSE 8000
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--timeout", "90", "--workers", "2", "--threads", "4"]
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--timeout", "90", "--workers", "1", "--threads", "8"]

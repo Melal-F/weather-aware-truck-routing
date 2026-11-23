@@ -49,6 +49,17 @@ class PlanApiTest(SimpleTestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIn("ORS_API_KEY", response.json()["error"])
 
+    @patch("routing.views.location_timezone", return_value="America/New_York")
+    def test_timezone_returns_the_iana_name(self, lookup):
+        response = Client().get("/api/timezone", {"lat": "33.75", "lng": "-84.39"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"tz": "America/New_York"})
+        lookup.assert_called_once_with(33.75, -84.39)
+
+    def test_timezone_requires_coordinates(self):
+        response = Client().get("/api/timezone")
+        self.assertEqual(response.status_code, 400)
+
     def test_geocode_short_query_is_empty(self):
         response = Client().get("/api/geocode", {"q": "a"})
         self.assertEqual(response.status_code, 200)

@@ -100,8 +100,9 @@ def time_at_coords(coords, spans, total_duration):
     return seconds
 
 
-def seconds_at_mile(coords, seconds, mile):
-    miles = cumulative_miles(coords)
+def seconds_at_mile(coords, seconds, mile, miles=None):
+    if miles is None:
+        miles = cumulative_miles(coords)
     if not miles:
         return 0.0
     if mile <= 0:
@@ -129,7 +130,7 @@ def place_checkpoints(coords, spacing_miles, departure, duration_seconds, time_s
                 "mile": mile,
                 "lat": lat,
                 "lng": lng,
-                "eta": departure + timedelta(seconds=seconds_at_mile(coords, time_seconds, mile)),
+                "eta": departure + timedelta(seconds=seconds_at_mile(coords, time_seconds, mile, miles)),
             }
         )
     return placed

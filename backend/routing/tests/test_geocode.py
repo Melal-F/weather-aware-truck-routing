@@ -51,6 +51,7 @@ class OrsAutocompleteTest(SimpleTestCase):
             ors_autocomplete("Dallas"),
             [{"name": "Dallas, TX, USA", "lat": 32.777, "lng": -96.797}],
         )
+        self.assertEqual(get.call_args.kwargs["timeout"], (5, 20))
 
     @patch.dict(os.environ, {"ORS_API_KEY": "test-key"})
     @patch("routing.services.requests.get")

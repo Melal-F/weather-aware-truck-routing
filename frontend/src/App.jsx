@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import MapView from "./MapView";
 import {
   RISK_COLORS,
   RISK_LEVELS,
+  dateFormatter,
   dayKey,
   dayOffset,
   formatClock,
@@ -10,6 +11,7 @@ import {
   formatTripStamp,
   formatWeekday,
   formatDrive,
+  fetchTimezone,
   geocode,
   planTrip,
   routeLetter,
@@ -110,18 +112,78 @@ function formatLocal(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function defaultDeparture() {
-  const next = new Date();
-  next.setMinutes(0, 0, 0);
-  next.setHours(next.getHours() + 1);
-  return formatLocal(next);
+function pad(value) {
+  return String(value).padStart(2, "0");
 }
 
-function departureWindow(now = new Date()) {
-  return {
-    min: formatLocal(new Date(now.getTime() - 60 * 60 * 1000)),
-    max: formatLocal(new Date(now.getTime() + 13 * 24 * 60 * 60 * 1000)),
+function zonedParts(date, timeZone) {
+  const options = {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
   };
+  if (timeZone) options.timeZone = timeZone;
+  const parts = dateFormatter("en-US", options).formatToParts(date);
+  const pick = (type) => Number(parts.find((part) => part.type === type).value);
+  let hour = pick("hour");
+  if (hour === 24) hour = 0;
+  return {
+    year: pick("year"),
+    month: pick("month"),
+    day: pick("day"),
+    hour,
+    minute: pick("minute"),
+    second: pick("second"),
+  };
+}
+
+function formatInZone(date, timeZone) {
+  if (!timeZone) return formatLocal(date);
+  const parts = zonedParts(date, timeZone);
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`;
+}
+
+function nextFullHour(now, timeZone) {
+  if (!timeZone) {
+    const next = new Date(now);
+    next.setMinutes(0, 0, 0);
+    next.setHours(next.getHours() + 1);
+    return formatLocal(next);
+  }
+  const parts = zonedParts(now, timeZone);
+  const into = (parts.minute * 60 + parts.second) * 1000 + now.getMilliseconds();
+  return formatInZone(new Date(now.getTime() - into + 60 * 60 * 1000), timeZone);
+}
+
+function defaultDeparture() {
+  return nextFullHour(new Date());
+}
+
+function departureWindow(now = new Date(), timeZone) {
+  return {
+    min: formatInZone(new Date(now.getTime() - 60 * 60 * 1000), timeZone),
+    max: formatInZone(new Date(now.getTime() + 13 * 24 * 60 * 60 * 1000), timeZone),
+  };
+}
+
+function activeWindow(hasOrigin, timeZone) {
+  // The viewer's clock must not reject a time that is still ahead at the origin.
+  if (hasOrigin && !timeZone) return { min: "1970-01-01T00:00", max: "9999-12-31T23:59" };
+  return departureWindow(new Date(), timeZone);
+}
+
+function zoneAbbrev(timeZone, date = new Date()) {
+  if (!timeZone) return "";
+  const parts = dateFormatter("en-US", {
+    timeZone,
+    hour: "numeric",
+    timeZoneName: "short",
+  }).formatToParts(date);
+  return parts.find((part) => part.type === "timeZoneName")?.value || "";
 }
 
 function parseLocal(value) {
@@ -129,6 +191,258 @@ function parseLocal(value) {
   const [year, month, date] = day.split("-").map(Number);
   const [hour, minute] = clock.split(":").map(Number);
   return new Date(year, month - 1, date, hour, minute);
+}
+
+function sameDay(a, b) {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+function clockParts(value) {
+  const date = parseLocal(value);
+  const hour24 = date.getHours();
+  return { hour: hour24 % 12 || 12, minute: date.getMinutes(), ap: hour24 >= 12 ? "PM" : "AM" };
+}
+
+function dayAllowed(day, min, max) {
+  const start = new Date(day.getFullYear(), day.getMonth(), day.getDate());
+  const end = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 23, 59);
+  return end >= parseLocal(min) && start <= parseLocal(max);
+}
+
+function monthCells(month) {
+  const first = new Date(month.getFullYear(), month.getMonth(), 1);
+  const cursor = new Date(first);
+  cursor.setDate(1 - first.getDay());
+  return Array.from({ length: 42 }, () => {
+    const day = new Date(cursor);
+    cursor.setDate(cursor.getDate() + 1);
+    return day;
+  });
+}
+
+function departureLabel(value) {
+  return dateFormatter("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(parseLocal(value));
+}
+
+function DepartureField({ id, value, min, max, invalid, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [place, setPlace] = useState(null);
+  const [month, setMonth] = useState(() => parseLocal(value));
+  const [hourDraft, setHourDraft] = useState(null);
+  const [minuteDraft, setMinuteDraft] = useState(null);
+  const root = useRef(null);
+  const button = useRef(null);
+  const pop = useRef(null);
+  const parts = clockParts(value);
+  const view = new Date(month.getFullYear(), month.getMonth(), 1);
+  const monthKey = view.getFullYear() * 12 + view.getMonth();
+  const minKey = (() => { const d = parseLocal(min); return d.getFullYear() * 12 + d.getMonth(); })();
+  const maxKey = (() => { const d = parseLocal(max); return d.getFullYear() * 12 + d.getMonth(); })();
+
+  function write(date) {
+    let next = formatLocal(date);
+    if (next < min) next = min;
+    else if (next > max) next = max;
+    onChange(next);
+    return next;
+  }
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const rect = button.current.getBoundingClientRect();
+    const width = pop.current?.offsetWidth || 292;
+    const height = pop.current?.offsetHeight || 360;
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    let top = rect.bottom + 6;
+    if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 6);
+    setPlace({ top, left });
+    const onDoc = (event) => {
+      if (!root.current?.contains(event.target)) setOpen(false);
+    };
+    const onKey = (event) => {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      button.current?.focus();
+    };
+    const close = () => setOpen(false);
+    const stopWheel = (event) => event.preventDefault();
+    const node = pop.current;
+    node?.addEventListener("wheel", stopWheel, { passive: false });
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      node?.removeEventListener("wheel", stopWheel);
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [open]);
+
+  function onHour(text) {
+    const digits = text.replace(/\D/g, "").slice(-2);
+    setHourDraft(digits);
+    const n = Number(digits);
+    if (!digits || n < 1 || n > 12) return;
+    const date = parseLocal(value);
+    date.setHours((n % 12) + (date.getHours() >= 12 ? 12 : 0));
+    const next = clockParts(write(date));
+    if (next.hour !== n) setHourDraft(null);
+  }
+
+  function onMinute(text) {
+    const digits = text.replace(/\D/g, "").slice(-2);
+    setMinuteDraft(digits);
+    if (digits === "" || Number(digits) > 59) return;
+    const date = parseLocal(value);
+    date.setMinutes(Number(digits));
+    const next = clockParts(write(date));
+    if (next.minute !== Number(digits)) setMinuteDraft(null);
+  }
+
+  function setAp(ap) {
+    const date = parseLocal(value);
+    const pm = date.getHours() >= 12;
+    if (ap === "PM" && !pm) date.setHours(date.getHours() + 12);
+    if (ap === "AM" && pm) date.setHours(date.getHours() - 12);
+    write(date);
+    setHourDraft(null);
+  }
+
+  function onGridKey(event) {
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 }[event.key];
+    if (!step || !event.target.classList.contains("when-day")) return;
+    const days = [...event.currentTarget.querySelectorAll(".when-day")];
+    let index = days.indexOf(event.target) + step;
+    while (days[index]?.disabled) index += Math.sign(step);
+    if (!days[index]) return;
+    event.preventDefault();
+    days[index].focus();
+  }
+
+  return (
+    <div className="when" ref={root}>
+      <button
+        ref={button}
+        id={id}
+        type="button"
+        className={invalid ? "when-trigger invalid" : "when-trigger"}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-invalid={invalid || undefined}
+        aria-labelledby={`departure-label ${id}-value`}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          setMonth(parseLocal(value));
+          setHourDraft(null);
+          setMinuteDraft(null);
+          setOpen(true);
+        }}
+      >
+        <span id={`${id}-value`}>{departureLabel(value)}</span>
+        <Icon>
+          <rect x="2.25" y="3.25" width="11.5" height="10.5" rx="1.5" {...stroke()} />
+          <path d="M2.25 6.5h11.5M5.25 2v2.5M10.75 2v2.5" {...stroke()} />
+        </Icon>
+      </button>
+      {open && (
+        <div
+          ref={pop}
+          className="when-pop"
+          role="dialog"
+          aria-label="Departure date and time"
+          style={{ top: place?.top ?? 0, left: place?.left ?? 0, visibility: place ? "visible" : "hidden" }}
+        >
+          <div className="when-head">
+            <button type="button" className="when-nav" aria-label="Previous month" disabled={monthKey <= minKey} onClick={() => setMonth(new Date(view.getFullYear(), view.getMonth() - 1, 1))}>
+              <Icon><path d="M9.5 3.5 5.5 8l4 4.5" {...stroke()} /></Icon>
+            </button>
+            <strong>
+              {view.toLocaleDateString("en-US", { month: "long", year: "numeric" })}
+            </strong>
+            <button type="button" className="when-nav" aria-label="Next month" disabled={monthKey >= maxKey} onClick={() => setMonth(new Date(view.getFullYear(), view.getMonth() + 1, 1))}>
+              <Icon><path d="M6.5 3.5 10.5 8l-4 4.5" {...stroke()} /></Icon>
+            </button>
+          </div>
+          <div className="when-grid" onKeyDown={onGridKey}>
+            {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((name) => (
+              <span key={name} className="when-dow">{name}</span>
+            ))}
+            {monthCells(view).map((day) => {
+              const allowed = dayAllowed(day, min, max);
+              const selected = sameDay(day, parseLocal(value));
+              return (
+                <button
+                  key={formatLocal(day).slice(0, 10)}
+                  type="button"
+                  className={["when-day", selected ? "on" : "", sameDay(day, new Date()) ? "today" : ""].filter(Boolean).join(" ")}
+                  disabled={!allowed}
+                  aria-pressed={selected}
+                  aria-label={day.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+                  onClick={() => {
+                    const next = new Date(day);
+                    const current = parseLocal(value);
+                    next.setHours(current.getHours(), current.getMinutes(), 0, 0);
+                    write(next);
+                    setMonth(next);
+                    setHourDraft(null);
+                    setMinuteDraft(null);
+                  }}
+                >
+                  {day.getDate()}
+                </button>
+              );
+            })}
+          </div>
+          <div className="when-time">
+            <span>Time</span>
+            <div className="when-clock">
+              <input
+                aria-label="Hour"
+                inputMode="numeric"
+                value={hourDraft ?? String(parts.hour)}
+                onFocus={(event) => event.target.select()}
+                onChange={(event) => onHour(event.target.value)}
+                onBlur={() => setHourDraft(null)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.preventDefault();
+                }}
+              />
+              <span className="when-colon" aria-hidden="true">:</span>
+              <input
+                aria-label="Minute"
+                inputMode="numeric"
+                value={minuteDraft ?? String(parts.minute).padStart(2, "0")}
+                onFocus={(event) => event.target.select()}
+                onChange={(event) => onMinute(event.target.value)}
+                onBlur={() => setMinuteDraft(null)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.preventDefault();
+                }}
+              />
+            </div>
+            <div className="when-ap" role="group" aria-label="AM or PM">
+              {["AM", "PM"].map((ap) => (
+                <button key={ap} type="button" className={parts.ap === ap ? "on" : ""} aria-pressed={parts.ap === ap} onClick={() => setAp(ap)}>
+                  {ap}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function groupLoad(value) {
@@ -257,7 +571,7 @@ function SpacingControl({ value, onChange, labelledBy }) {
   );
 }
 
-function RouteCard({ route, plan, selected, onSelect }) {
+const RouteCard = memo(function RouteCard({ route, plan, selected, onSelect }) {
   const unsafe = (route.miles["No Travel"] || 0) > 0 || (route.miles.Unassessed || 0) > 0;
   const levels = [...RISK_LEVELS, "Unassessed"].filter((level) => (route.miles[level] || 0) > 0);
   const total = levels.reduce((sum, level) => sum + (route.miles[level] || 0), 0);
@@ -328,9 +642,9 @@ function RouteCard({ route, plan, selected, onSelect }) {
       </div>
     </button>
   );
-}
+});
 
-function Checkpoints({ route, onHover, onFocus }) {
+const Checkpoints = memo(function Checkpoints({ route, onHover, onFocus }) {
   return (
     <section>
       <div className="section-head checks-head">
@@ -406,15 +720,16 @@ function Checkpoints({ route, onHover, onFocus }) {
       </div>
     </section>
   );
-}
+});
 
-function midnightMarks(forecastStart) {
+function midnightMarks(forecastStart, timeZone) {
   const start = new Date(forecastStart).getTime();
   const marks = [];
   for (let hour = 0; hour <= 48; hour += 1) {
     const date = new Date(start + hour * 3600000);
-    if (date.getHours() === 0 && date.getMinutes() === 0) {
-      marks.push({ hour, label: formatWeekday(date.toISOString()) });
+    const parts = zonedParts(date, timeZone);
+    if (parts.hour === 0 && parts.minute === 0) {
+      marks.push({ hour, label: formatWeekday(date.toISOString(), timeZone) });
     }
   }
   return marks;
@@ -435,6 +750,8 @@ export default function App() {
   const [destQuery, setDestQuery] = useState("");
   const [destPick, setDestPick] = useState(null);
   const [departure, setDeparture] = useState(defaultDeparture);
+  const [originTz, setOriginTz] = useState("");
+  const departureTouched = useRef(false);
   const [load, setLoad] = useState("42000");
   const [loadFocus, setLoadFocus] = useState(false);
   const [spacing, setSpacing] = useState("25");
@@ -450,6 +767,63 @@ export default function App() {
   const [highlight, setHighlight] = useState(null);
   const [focus, setFocus] = useState(null);
   const sliderRef = useRef(null);
+
+  useEffect(() => {
+    if (!originPick) {
+      setOriginTz("");
+      return undefined;
+    }
+    let cancelled = false;
+    fetchTimezone(originPick.lat, originPick.lng)
+      .then((tz) => {
+        if (cancelled || !tz) return;
+        setOriginTz(tz);
+        setDeparture((current) => {
+          const { min, max } = departureWindow(new Date(), tz);
+          const next = departureTouched.current ? current : nextFullHour(new Date(), tz);
+          if (next < min) return min;
+          if (next > max) return max;
+          return next;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setOriginTz("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [originPick]);
+  // Plan in the background once both places are picked, so the click finds the answer ready.
+  const early = useRef({ key: "", request: null });
+
+  function planBody(origin, destination) {
+    return {
+      origin,
+      destination,
+      departure,
+      load_lb: Number(String(load).replace(/[^\d.]/g, "")),
+      spacing_miles: Number(spacing),
+    };
+  }
+
+  useEffect(() => {
+    if (!originPick || !destPick) return undefined;
+    const body = planBody(originPick, destPick);
+    if (!(body.load_lb > 0)) return undefined;
+    const key = JSON.stringify(body);
+    if (early.current.key === key) return undefined;
+    const timer = setTimeout(() => {
+      const request = planTrip(body);
+      // A failed early request is simply retried by the click.
+      request.catch(() => {
+        if (early.current.request === request) early.current = { key: "", request: null };
+      });
+      early.current = { key, request };
+    }, 500);
+    return () => clearTimeout(timer);
+    // planBody reads exactly these values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [originPick, destPick, departure, load, spacing]);
 
   useEffect(() => {
     if (!playing || !plan) return undefined;
@@ -483,9 +857,8 @@ export default function App() {
       setLive(message);
       return;
     }
-    const { min, max } = departureWindow();
-    const chosen = parseLocal(departure);
-    if (chosen < parseLocal(min) || chosen > parseLocal(max)) {
+    const { min, max } = activeWindow(Boolean(originPick), originTz);
+    if (departure < min || departure > max) {
       const message = "Departure must be between now and 13 days ahead (forecast limit).";
       setError(message);
       setLive(message);
@@ -499,13 +872,11 @@ export default function App() {
       setOriginQuery(origin.name);
       setDestPick(destination);
       setDestQuery(destination.name);
-      const next = await planTrip({
-        origin,
-        destination,
-        departure,
-        load_lb: loadLb,
-        spacing_miles: Number(spacing),
-      });
+      const body = planBody(origin, destination);
+      const key = JSON.stringify(body);
+      const next = await (early.current.key === key
+        ? early.current.request.catch(() => planTrip(body))
+        : planTrip(body));
       const winner = next.routes.find((route) => route.recommended) || next.routes[0];
       const count = next.routes.length;
       const recommended = next.routes.find((route) => route.recommended);
@@ -544,7 +915,8 @@ export default function App() {
     setHour((current) => Math.min(48, Math.max(0, current + delta)));
   }
 
-  const { min: departureMin, max: departureMax } = departureWindow();
+  const { min: departureMin, max: departureMax } = activeWindow(Boolean(originPick), originTz);
+  const departureAbbrev = zoneAbbrev(originTz);
   const showForm = !plan || editing;
   const selectedRoute = plan?.routes.find((route) => route.id === selected) || null;
   const recommended = plan?.routes.find((route) => route.recommended) || null;
@@ -558,7 +930,7 @@ export default function App() {
     windowEnd = Math.max(0, Math.min(48, (end - start) / 3600000));
   }
   const ticks = [0, 6, 12, 18, 24, 30, 36, 42, 48];
-  const days = plan ? midnightMarks(plan.forecast_start) : [];
+  const days = plan ? midnightMarks(plan.forecast_start, plan.origin?.tz) : [];
 
   return (
     <div className="shell">
@@ -604,25 +976,19 @@ export default function App() {
                   </div>
                   <div className="split">
                     <div className="field">
-                      <label htmlFor="departure">Departure (origin local time)</label>
-                      <input
+                      <label id="departure-label" htmlFor="departure">
+                        Departure time{departureAbbrev ? ` (${departureAbbrev})` : ""}
+                      </label>
+                      <DepartureField
                         id="departure"
-                        type="datetime-local"
                         value={departure}
                         min={departureMin}
                         max={departureMax}
-                        aria-invalid={/departure/i.test(error) || undefined}
-                        className={/departure/i.test(error) ? "invalid" : ""}
-                        onChange={(event) => setDeparture(event.target.value)}
-                        onInvalid={(event) => {
-                          const { rangeUnderflow, rangeOverflow } = event.target.validity;
-                          if (!rangeUnderflow && !rangeOverflow) return;
-                          event.preventDefault();
-                          const message = "Departure must be between now and 13 days ahead (forecast limit).";
-                          setError(message);
-                          setLive(message);
+                        invalid={/departure/i.test(error)}
+                        onChange={(value) => {
+                          departureTouched.current = true;
+                          setDeparture(value);
                         }}
-                        required
                       />
                     </div>
                     <div className="field">
@@ -770,7 +1136,7 @@ export default function App() {
                   className="dock-time"
                   title="Play walks the 48 hours on the corridor already loaded. Checkpoint risk stays tied to arrival time."
                 >
-                  <strong>{formatDayClock(forecastIso)}</strong>
+                  <strong>{formatDayClock(forecastIso, plan.origin?.tz)}</strong>
                   <span>+{hour} h</span>
                 </div>
                 <div className="scrub">
