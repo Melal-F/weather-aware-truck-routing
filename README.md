@@ -1,6 +1,6 @@
 # Weather-Aware Truck Routing
 
-Live demo: https://YOUR-APP.onrender.com
+Live demo: https://weather-truck-routing-wmd9.onrender.com/
 
 A React and Django desk for a truck driver. Enter an origin, a destination, a departure time, and a load weight. The app asks OpenRouteService for up to three driving routes, samples weather along each one, and recommends the safest option.
 
