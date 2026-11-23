@@ -140,11 +140,6 @@ function milesRound(value) {
   return `${Math.round(Number(value) || 0).toLocaleString("en-US")} mi`;
 }
 
-function milesExact(value) {
-  const text = (Number(value) || 0).toFixed(1).replace(/\.0$/, "");
-  return `${text} mi`;
-}
-
 function stripLabel(route) {
   const parts = RISK_LEVELS.map((level) => `${level} ${Math.round(route.miles[level] || 0)} mi`);
   if ((route.miles.Unassessed || 0) > 0) {
@@ -319,7 +314,7 @@ function RouteCard({ route, plan, selected, onSelect }) {
               <li key={level}>
                 <i className="dot" style={{ width: 8, height: 8, background: RISK_COLORS[level] }} />
                 <span>{level}</span>
-                <b>{milesExact(route.miles[level])}</b>
+                <b>{milesRound(route.miles[level])}</b>
               </li>
             ))}
           </ul>
@@ -393,7 +388,7 @@ function Checkpoints({ route, onHover, onFocus }) {
                     onFocus({ routeId: route.id, index, nonce: Date.now() });
                   }}
                 >
-                  <td className="num">{reading(point.mile) ?? "—"}</td>
+                  <td className="num">{point.mile == null || Number.isNaN(Number(point.mile)) ? "—" : Math.round(Number(point.mile))}</td>
                   <td className="eta">
                     {showDay && <span className="eta-day">{formatWeekday(point.eta)}</span>}
                     {formatClock(point.eta)}
