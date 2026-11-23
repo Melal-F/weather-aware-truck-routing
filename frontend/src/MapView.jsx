@@ -408,6 +408,15 @@ export default function MapView({
     map.getPane("corridor").style.pointerEvents = "none";
     streets.addTo(map);
     layersRef.current = { streets, satellite, placeNames };
+    // Pruning drops the old tiles but leaves their scaled container until the
+    // next view update. Remove that level once the new tiles have loaded.
+    const dropEmptyLevels = (layer) => {
+      if (layer._updateLevels) layer.on("load", () => layer._updateLevels());
+      if (layer.eachLayer) layer.eachLayer(dropEmptyLevels);
+    };
+    dropEmptyLevels(streets);
+    dropEmptyLevels(satellite);
+    dropEmptyLevels(placeNames);
     map.createPane("routes");
     map.getPane("routes").style.zIndex = 450;
     map.createPane("checks");
