@@ -315,7 +315,7 @@ function popupHtml(point) {
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4 4 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
       </button>
       <div class="popup-top"><strong>Mile ${mile}</strong><span class="popup-risk">${level}</span></div>
-      <div class="popup-eta">${esc(formatDayClock(point.eta))}</div>
+      <div class="popup-eta">${esc(formatDayClock(point.eta, point.tz))}</div>
       <dl class="wx">
         ${row("Wind", point.wind_mph, "mph", point.wind_level)}
         ${row("Rain", point.rain_in_hr, "in/hr", point.rain_level)}
@@ -327,7 +327,7 @@ function popupHtml(point) {
 
 function tipLine(point) {
   const mile = Math.round(Number(point.mile) || 0);
-  return `Mile ${mile} · ${formatClock(point.eta)} · ${point.level || "No data"}`;
+  return `Mile ${mile} · ${formatClock(point.eta, point.tz)} · ${point.level || "No data"}`;
 }
 
 function token(name, fallback) {

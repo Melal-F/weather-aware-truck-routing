@@ -3,6 +3,7 @@ import MapView from "./MapView";
 import {
   RISK_COLORS,
   RISK_LEVELS,
+  dayKey,
   dayOffset,
   formatClock,
   formatDayClock,
@@ -260,7 +261,7 @@ function RouteCard({ route, plan, selected, onSelect }) {
   const unsafe = (route.miles["No Travel"] || 0) > 0 || (route.miles.Unassessed || 0) > 0;
   const levels = [...RISK_LEVELS, "Unassessed"].filter((level) => (route.miles[level] || 0) > 0);
   const total = levels.reduce((sum, level) => sum + (route.miles[level] || 0), 0);
-  const offset = dayOffset(plan.departure, route.arrival);
+  const offset = dayOffset(plan.departure, route.arrival, plan.origin?.tz, plan.destination?.tz);
   const rows = levelRows(route.miles);
   return (
     <button
@@ -292,7 +293,7 @@ function RouteCard({ route, plan, selected, onSelect }) {
         </div>
         <div>
           <span>Arrives</span>
-          <strong>{formatClock(route.arrival)}</strong>
+          <strong>{formatClock(route.arrival, plan.destination?.tz)}</strong>
           {offset > 0 && <em>+{offset} day{offset === 1 ? "" : "s"}</em>}
         </div>
       </div>
@@ -329,11 +330,6 @@ function RouteCard({ route, plan, selected, onSelect }) {
   );
 }
 
-function localDay(iso) {
-  const date = new Date(iso);
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-}
-
 function Checkpoints({ route, onHover, onFocus }) {
   return (
     <section>
@@ -368,7 +364,7 @@ function Checkpoints({ route, onHover, onFocus }) {
             {route.checkpoints.map((point, index) => {
               const level = point.level;
               const previous = route.checkpoints[index - 1];
-              const showDay = !previous || localDay(previous.eta) !== localDay(point.eta);
+              const showDay = !previous || dayKey(previous.eta, previous.tz) !== dayKey(point.eta, point.tz);
               const riskStyle = !level || level === "Low"
                 ? undefined
                 : {
@@ -390,8 +386,8 @@ function Checkpoints({ route, onHover, onFocus }) {
                 >
                   <td className="num">{point.mile == null || Number.isNaN(Number(point.mile)) ? "—" : Math.round(Number(point.mile))}</td>
                   <td className="eta">
-                    {showDay && <span className="eta-day">{formatWeekday(point.eta)}</span>}
-                    {formatClock(point.eta)}
+                    {showDay && <span className="eta-day">{formatWeekday(point.eta, point.tz)}</span>}
+                    {formatClock(point.eta, point.tz)}
                   </td>
                   <td className="num">{reading(point.wind_mph) == null ? <span className="missing">—</span> : reading(point.wind_mph)}</td>
                   <td className="num">{reading(point.rain_in_hr) == null ? <span className="missing">—</span> : reading(point.rain_in_hr)}</td>
@@ -506,7 +502,7 @@ export default function App() {
       const next = await planTrip({
         origin,
         destination,
-        departure: when.toISOString(),
+        departure,
         load_lb: loadLb,
         spacing_miles: Number(spacing),
       });
@@ -608,7 +604,7 @@ export default function App() {
                   </div>
                   <div className="split">
                     <div className="field">
-                      <label htmlFor="departure">Departure</label>
+                      <label htmlFor="departure">Departure (origin local time)</label>
                       <input
                         id="departure"
                         type="datetime-local"
@@ -628,7 +624,6 @@ export default function App() {
                         }}
                         required
                       />
-                      <p className="hint">Times shown in your browser's time zone</p>
                     </div>
                     <div className="field">
                       <label htmlFor="load">Load</label>
@@ -670,7 +665,7 @@ export default function App() {
                     <button type="button" className="text-btn" onClick={() => setEditing(true)}>Edit</button>
                   </div>
                   <p className="summary-meta">
-                    {formatTripStamp(plan.departure)}
+                    {formatTripStamp(plan.departure, plan.origin?.tz)}
                     {" · "}
                     {Number(plan.load_lb).toLocaleString("en-US")} lb
                     {" · every "}

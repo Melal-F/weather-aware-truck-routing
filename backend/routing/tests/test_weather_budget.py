@@ -130,7 +130,7 @@ class WeatherBudgetTest(unittest.TestCase):
         plan = build_plan(
             _body(
                 origin={"name": "A", "lat": 41.0, "lng": -87.6},
-                destination={"name": "B", "lat": 41.018, "lng": -87.6},
+                destination={"name": "B", "lat": 41.004, "lng": -87.6},
                 spacing_miles=10,
             ),
             _short_route,
@@ -182,6 +182,43 @@ class WeatherBudgetTest(unittest.TestCase):
             self.assertEqual(lat, round(lat, 1))
             self.assertEqual(lng, round(lng, 1))
         self.assertEqual(plan["corridor_cell_deg"], 0.2)
+
+    @patch("routing.services.requests.get")
+    def test_naive_departure_is_read_in_the_origin_zone(self, get):
+        def forecast(url, params=None, timeout=None):
+            if params.get("hourly") == "temperature_2m":
+                return _response(200, {"timezone": "America/Denver", "hourly": {"time": HOURS[:1]}})
+            lats = [part for part in str(params["latitude"]).split(",") if part]
+            count = len(HOURS)
+            rows = [
+                {
+                    "timezone": "America/Denver",
+                    "hourly": {
+                        "time": HOURS,
+                        "wind_speed_10m": [10.0] * count,
+                        "rain": [0.0] * count,
+                        "showers": [0.0] * count,
+                        "snowfall": [0.0] * count,
+                    },
+                }
+                for _lat in lats
+            ]
+            return _response(200, rows[0] if len(rows) == 1 else rows)
+
+        get.side_effect = forecast
+        plan = build_plan(
+            _body(
+                origin={"name": "Denver", "lat": 39.74, "lng": -104.99},
+                destination={"name": "Salt Lake City", "lat": 40.76, "lng": -111.89},
+                departure="2026-11-18T12:30:00",
+            ),
+            _short_route,
+            open_meteo,
+        )
+        self.assertEqual(plan["departure"], "2026-11-18T19:30:00+00:00")
+        self.assertEqual(plan["origin"]["tz"], "America/Denver")
+        self.assertEqual(plan["destination"]["tz"], "America/Denver")
+        self.assertTrue(all(point["tz"] == "America/Denver" for point in plan["routes"][0]["checkpoints"]))
 
     @patch("routing.services.requests.get")
     def test_open_meteo_429_is_plan_error_503(self, get):

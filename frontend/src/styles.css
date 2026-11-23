@@ -592,7 +592,12 @@ input.invalid { border-color: var(--danger-text); }
   white-space: nowrap;
 }
 
-.checks td.eta { height: auto; padding-top: 6px; padding-bottom: 6px; }
+.checks td.eta {
+  height: auto;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  white-space: normal;
+}
 .eta-day { display: block; color: var(--text-2); }
 
 .checks tbody tr + tr td { border-top: 1px solid var(--border); }

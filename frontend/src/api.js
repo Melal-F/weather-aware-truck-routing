@@ -25,47 +25,67 @@ export function formatDrive(seconds) {
   return `${hours} h ${minutes} m`;
 }
 
-export function formatClock(iso) {
+function zoned(iso, tz, options) {
   const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
+  if (Number.isNaN(date.getTime())) return null;
+  const format = { ...options };
+  if (tz) format.timeZone = tz;
+  else delete format.timeZoneName;
+  return new Intl.DateTimeFormat(undefined, format).format(date);
 }
 
-export function formatWeekday(iso) {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  return new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date);
+export function formatClock(iso, tz) {
+  const text = zoned(iso, tz, {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: tz ? "short" : undefined,
+  });
+  return text || "—";
 }
 
-export function formatDayClock(iso) {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
+export function formatWeekday(iso, tz) {
+  return zoned(iso, tz, { weekday: "short" }) || "";
+}
+
+export function formatDayClock(iso, tz) {
+  const text = zoned(iso, tz, {
     weekday: "short",
     hour: "numeric",
     minute: "2-digit",
-  }).format(date).replace(/,/g, "");
+    timeZoneName: tz ? "short" : undefined,
+  });
+  return text ? text.replace(/,/g, "") : "—";
 }
 
-export function formatTripStamp(iso) {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
+export function formatTripStamp(iso, tz) {
+  return zoned(iso, tz, {
     weekday: "short",
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  }).format(date);
+    timeZoneName: tz ? "short" : undefined,
+  }) || "—";
 }
 
-export function dayOffset(fromIso, toIso) {
-  const from = new Date(fromIso);
-  const to = new Date(toIso);
-  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return 0;
-  const start = new Date(from.getFullYear(), from.getMonth(), from.getDate());
-  const end = new Date(to.getFullYear(), to.getMonth(), to.getDate());
-  return Math.round((end.getTime() - start.getTime()) / 86400000);
+export function dayKey(iso, tz) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(tz ? { timeZone: tz } : {}),
+  }).formatToParts(date);
+  const pick = (type) => parts.find((part) => part.type === type).value;
+  return `${pick("year")}-${pick("month")}-${pick("day")}`;
+}
+
+export function dayOffset(fromIso, toIso, fromTz, toTz) {
+  const start = Date.parse(dayKey(fromIso, fromTz));
+  const end = Date.parse(dayKey(toIso, toTz || fromTz));
+  if (Number.isNaN(start) || Number.isNaN(end)) return 0;
+  return Math.round((end - start) / 86400000);
 }
 
 export function formatWhen(iso) {

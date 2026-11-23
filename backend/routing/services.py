@@ -5,6 +5,7 @@ import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from django.core.cache import cache
@@ -95,7 +96,33 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
-def parse_departure(value, now=None):
+def _zone(name):
+    if not name or name in ("GMT", "UTC", "Etc/GMT"):
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def _zone_name(payload):
+    name = payload.get("timezone") if isinstance(payload, dict) else None
+    return name if _zone(name) else None
+
+
+def _first_utc(times, tz_name):
+    if not times:
+        return None
+    stamp = datetime.fromisoformat(times[0])
+    if stamp.tzinfo is not None:
+        return stamp.astimezone(timezone.utc)
+    zone = _zone(tz_name)
+    if zone is not None:
+        return stamp.replace(tzinfo=zone).astimezone(timezone.utc)
+    return stamp.replace(tzinfo=timezone.utc)
+
+
+def parse_departure(value, now=None, zone=None):
     if not isinstance(value, str) or not value.strip():
         raise PlanError("Departure date and time is required.")
     text = value.strip()
@@ -106,13 +133,41 @@ def parse_departure(value, now=None):
     except ValueError:
         raise PlanError("Departure must be an ISO date and time.") from None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=_zone(zone) or timezone.utc)
     parsed = parsed.astimezone(timezone.utc)
     if now is None:
         now = _utcnow()
     if parsed < now - timedelta(hours=1) or parsed > now + timedelta(days=DEPARTURE_MAX_DAYS):
         raise PlanError("Departure must be between now and 13 days ahead (forecast limit).")
     return parsed
+
+
+def location_timezone(lat, lng):
+    """IANA zone for a coordinate, from Open-Meteo's forecast timezone field."""
+    key = f"tz:{round(lat, 2):.2f}:{round(lng, 2):.2f}"
+    cached = cache.get(key)
+    if isinstance(cached, str) and cached:
+        return cached
+    response = session.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": f"{lat:.2f}",
+            "longitude": f"{lng:.2f}",
+            "timezone": "auto",
+            "forecast_days": 1,
+            "hourly": "temperature_2m",
+        },
+        timeout=(5, 20),
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    name = _zone_name(payload) if response.status_code < 400 else None
+    if not name:
+        raise PlanError("The weather service returned an unexpected forecast.", status=502)
+    cache.set(key, name, WEATHER_CACHE_SECONDS)
+    return name
 
 
 def parse_place(value, label):
@@ -487,9 +542,10 @@ def _forecast_chunk(chunk, start, end):
             "longitude": ",".join(f"{lng:.5f}" for _lat, lng in chunk),
             "hourly": "wind_speed_10m,rain,showers,snowfall",
             "wind_speed_unit": "mph",
-            "timezone": "GMT",
-            "start_date": start.date().isoformat(),
-            "end_date": end.date().isoformat(),
+            "timezone": "auto",
+            # One day of slack so a local day still covers the UTC window.
+            "start_date": (start.date() - timedelta(days=1)).isoformat(),
+            "end_date": (end.date() + timedelta(days=1)).isoformat(),
         },
         timeout=(5, 20),
     )
@@ -526,10 +582,12 @@ def _forecast_chunk(chunk, start, end):
             else:
                 rain_total.append((steady or 0) + (shower or 0))
         times = hourly.get("time") or []
+        tz_name = _zone_name(row)
         rows.append(
             {
                 "time": times,
-                "first": datetime.fromisoformat(times[0]).replace(tzinfo=timezone.utc) if times else None,
+                "first": _first_utc(times, tz_name),
+                "tz": tz_name,
                 "wind_speed_10m": hourly.get("wind_speed_10m") or [],
                 "rain": rain_total,
                 "snowfall": hourly.get("snowfall") or [],
@@ -639,7 +697,19 @@ def build_plan(payload, fetch_routes, fetch_weather):
         raise PlanError("Request body must be a JSON object.")
     origin = parse_place(payload.get("origin"), "Origin")
     destination = parse_place(payload.get("destination"), "Destination")
-    departure = parse_departure(payload.get("departure"))
+    raw_departure = payload.get("departure")
+    zone = None
+    if isinstance(raw_departure, str):
+        text = raw_departure.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            probe = datetime.fromisoformat(text)
+        except ValueError:
+            probe = None
+        if probe is not None and probe.tzinfo is None:
+            zone = location_timezone(origin["lat"], origin["lng"])
+    departure = parse_departure(raw_departure, zone=zone)
     load_lb = parse_load(payload.get("load_lb"))
     spacing = parse_spacing(payload.get("spacing_miles"))
     if abs(origin["lat"] - destination["lat"]) < 1e-5 and abs(origin["lng"] - destination["lng"]) < 1e-5:
@@ -673,6 +743,11 @@ def build_plan(payload, fetch_routes, fetch_weather):
 
     checkpoint_keys = []
     seen_checkpoints = set()
+    for place in (origin, destination):
+        key = checkpoint_weather_key(place["lat"], place["lng"])
+        if key not in seen_checkpoints:
+            seen_checkpoints.add(key)
+            checkpoint_keys.append(key)
     for draft in drafts:
         for checkpoint in draft["checkpoints"]:
             key = checkpoint_weather_key(checkpoint["lat"], checkpoint["lng"])
@@ -709,7 +784,7 @@ def build_plan(payload, fetch_routes, fetch_weather):
     for row in series:
         if not row.get("first"):
             times = row.get("time") or []
-            row["first"] = datetime.fromisoformat(times[0]).replace(tzinfo=timezone.utc) if times else None
+            row["first"] = _first_utc(times, row.get("tz"))
     if not series or hour_index(series[0], start) is None or hour_index(series[0], start + timedelta(hours=48)) is None:
         raise PlanError(
             "The forecast does not cover that trip. Pick a departure within 13 days.",
@@ -731,12 +806,14 @@ def build_plan(payload, fetch_routes, fetch_weather):
                 checkpoint["lat"], checkpoint["lng"], checkpoint["eta"], checkpoint_weather_key,
             )
             scored = classify(wind, rain, snow, load_lb)
+            sample = by_key.get(checkpoint_weather_key(checkpoint["lat"], checkpoint["lng"]))
             checkpoints.append(
                 {
                     "mile": checkpoint["mile"],
                     "lat": checkpoint["lat"],
                     "lng": checkpoint["lng"],
                     "eta": checkpoint["eta"],
+                    "tz": sample.get("tz") if sample else None,
                     "wind_mph": wind,
                     "rain_in_hr": rain,
                     "snow_in_hr": snow,
@@ -790,8 +867,18 @@ def _round(value, places):
     return round(value, places)
 
 
-def _public_place(place):
-    return {"name": place["name"], "lat": round(place["lat"], 5), "lng": round(place["lng"], 5)}
+def _tz_at(by_key, place):
+    sample = by_key.get(checkpoint_weather_key(place["lat"], place["lng"]))
+    return sample.get("tz") if sample else None
+
+
+def _public_place(place, tz=None):
+    return {
+        "name": place["name"],
+        "lat": round(place["lat"], 5),
+        "lng": round(place["lng"], 5),
+        "tz": tz,
+    }
 
 
 def _public_route(route):
@@ -811,6 +898,7 @@ def _public_route(route):
                 "lat": round(point["lat"], 5),
                 "lng": round(point["lng"], 5),
                 "eta": point["eta"].isoformat(),
+                "tz": point.get("tz"),
                 "wind_mph": _round(point["wind_mph"], 1),
                 "rain_in_hr": _round(point["rain_in_hr"], 3),
                 "snow_in_hr": _round(point["snow_in_hr"], 3),
